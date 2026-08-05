@@ -58,5 +58,13 @@ harness = false
 name = "distance"
 harness = false
 
+[[bench]]
+name = "make_line"
+harness = false
+
+[[bench]]
+name = "length"
+harness = false
+
 [lints]
 workspace = true
