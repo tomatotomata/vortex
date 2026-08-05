@@ -9,13 +9,13 @@
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::extension::ExtDType;
 use vortex_array::expr::Expression;
@@ -30,6 +30,7 @@ use vortex_array::validity::Validity;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -39,11 +40,30 @@ use crate::extension::GeoMetadata;
 use crate::extension::Rect;
 use crate::extension::box_field_names;
 use crate::extension::box_storage_dtype;
+use crate::extension::build_rect_array;
 use crate::extension::coordinate::Dimension;
 use crate::extension::coordinate::box_corners;
 use crate::extension::coordinate::ordinates;
 use crate::extension::flatten_row_offsets;
-use crate::extension::validate_geometry_operands;
+use crate::extension::is_native_geometry;
+use crate::scalar_fn::execute::Execution;
+use crate::scalar_fn::execute::Operand;
+use crate::scalar_fn::execute::dispatch_unary;
+
+/// Validate the native geometry operand accepted by `envelope`.
+fn validate_envelope_operands(dtypes: &[DType]) -> VortexResult<()> {
+    vortex_ensure!(
+        dtypes.len() == 1,
+        "geo: envelope requires exactly one geometry operand, got {}",
+        dtypes.len()
+    );
+    vortex_ensure!(
+        is_native_geometry(&dtypes[0]),
+        "geo: envelope operand {} is not a native geometry type",
+        dtypes[0]
+    );
+    Ok(())
+}
 
 /// `envelope`: the axis-aligned bounding box of each geometry in a native geometry operand (a column
 /// or a constant literal), as a native 2-D `geoarrow.box` ([`Rect`]) column.
@@ -75,9 +95,12 @@ fn output_box_dtype() -> VortexResult<ExtDType<Rect>> {
 
 /// Compute each row's 2-D bounding box: the smallest rectangle covering all of the row's
 /// coordinates.
-fn row_boxes(storage: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<(Vec<ArrayRef>, Validity)> {
+fn row_boxes(
+    storage: ArrayRef,
+    valid: &Mask,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<(Vec<ArrayRef>, Validity)> {
     let len = storage.len();
-    let valid = storage.validity()?.execute_mask(len, ctx)?;
     let (row_offsets, coords) = flatten_row_offsets(storage, ctx)?;
 
     // A row has a box iff it is valid and owns at least one coordinate (an empty geometry has
@@ -110,8 +133,71 @@ fn row_boxes(storage: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<(Vec<Arr
             xmaxs.freeze().into_array(),
             ymaxs.freeze().into_array(),
         ],
-        Validity::from_mask(&valid & &non_empty, Nullability::Nullable),
+        Validity::from_mask(valid & &non_empty, Nullability::Nullable),
     ))
+}
+
+/// Compute boxes directly over a non-constant native geometry column.
+fn envelope_array(
+    array: ArrayRef,
+    valid: &Mask,
+    output_dtype: &ExtDType<Rect>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let len = array.len();
+    let is_rect = array
+        .dtype()
+        .as_extension_opt()
+        .ok_or_else(|| vortex_err!("geo: envelope operand is not a geometry extension type"))?
+        .is::<Rect>();
+    let storage = array
+        .execute::<ExtensionArray>(ctx)?
+        .storage_array()
+        .clone();
+
+    let (corners, output_validity) = if is_rect {
+        // A box is its own envelope: project the 2-D corner fields straight out of storage
+        // (dropping any z/m bounds). A stored box cannot be empty.
+        let coords = storage.execute::<StructArray>(ctx)?;
+        let corners = box_field_names(Dimension::Xy)
+            .iter()
+            .map(|name| coords.unmasked_field_by_name(name).cloned())
+            .collect::<VortexResult<Vec<_>>>()?;
+        (
+            corners,
+            Validity::from_mask(valid.clone(), Nullability::Nullable),
+        )
+    } else if !storage.dtype().is_list() {
+        // Point storage is the coordinate `Struct` itself: every row owns exactly one
+        // coordinate, so its box is degenerate and the corner columns are zero-copy projections.
+        let coords = storage.execute::<StructArray>(ctx)?;
+        let x = coords.unmasked_field_by_name("x")?.clone();
+        let y = coords.unmasked_field_by_name("y")?.clone();
+        (
+            vec![x.clone(), y.clone(), x, y],
+            Validity::from_mask(valid.clone(), Nullability::Nullable),
+        )
+    } else {
+        row_boxes(storage, valid, ctx)?
+    };
+
+    build_rect_array(output_dtype, corners, len, output_validity)
+}
+
+/// Execute `envelope` after shared constant/column and null dispatch.
+fn execute_envelope(
+    execution: Execution<1>,
+    output_dtype: &ExtDType<Rect>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    match execution.operands {
+        [Operand::Constant(scalar)] => {
+            let one = ConstantArray::new(scalar, 1).into_array();
+            let output = envelope_array(one, &Mask::new_true(1), output_dtype, ctx)?;
+            Ok(ConstantArray::new(output.execute_scalar(0, ctx)?, execution.len).into_array())
+        }
+        [Operand::Column(array)] => envelope_array(array, &execution.valid, output_dtype, ctx),
+    }
 }
 
 impl ScalarFnVTable for GeoEnvelope {
@@ -142,7 +228,7 @@ impl ScalarFnVTable for GeoEnvelope {
     }
 
     fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
-        validate_geometry_operands(dtypes)?;
+        validate_envelope_operands(dtypes)?;
         // Always nullable: an empty geometry has no box, so nulls can appear even over a
         // non-nullable operand.
         Ok(DType::Extension(output_box_dtype()?.erased()))
@@ -158,53 +244,13 @@ impl ScalarFnVTable for GeoEnvelope {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let array = args.get(0)?;
-        let len = array.len();
-        let ext = array
-            .dtype()
-            .as_extension_opt()
-            .ok_or_else(|| vortex_err!("geo: envelope operand is not a geometry extension type"))?;
-        let storage = array
-            .clone()
-            .execute::<ExtensionArray>(ctx)?
-            .storage_array()
-            .clone();
-
-        let (corners, output_validity) = if ext.is::<Rect>() {
-            // A box is its own envelope: project the 2-D corner fields straight out of storage
-            // (dropping any z/m bounds). A stored box cannot be empty, so the output validity
-            // is exactly the operand's, kept lazy.
-            let coords = storage.execute::<StructArray>(ctx)?;
-            let corners = box_field_names(Dimension::Xy)
-                .iter()
-                .map(|name| coords.unmasked_field_by_name(name).cloned())
-                .collect::<VortexResult<Vec<_>>>()?;
-            (corners, array.validity()?.into_nullable())
-        } else if !storage.dtype().is_list() {
-            // Point storage is the coordinate `Struct` itself: every row owns exactly one
-            // coordinate, so its box is degenerate and the corner columns are the ordinate
-            // arrays, zero-copy. No row can be empty, so the output validity is exactly the
-            // operand's, kept lazy.
-            let coords = storage.execute::<StructArray>(ctx)?;
-            let x = coords.unmasked_field_by_name("x")?.clone();
-            let y = coords.unmasked_field_by_name("y")?.clone();
-            (
-                vec![x.clone(), y.clone(), x, y],
-                array.validity()?.into_nullable(),
-            )
-        } else {
-            row_boxes(storage, ctx)?
-        };
-
-        // Nullness lives at the box (struct) level: the corner fields stay non-nullable `f64`,
-        // holding unspecified values under null rows.
-        let storage = StructArray::try_new(
-            FieldNames::from(box_field_names(Dimension::Xy)),
-            corners,
-            len,
-            output_validity,
-        )?
-        .into_array();
-        Ok(ExtensionArray::try_new(output_box_dtype()?.erased(), storage)?.into_array())
+        let output_dtype = output_box_dtype()?;
+        dispatch_unary(
+            &array,
+            DType::Extension(output_dtype.clone().erased()),
+            |execution, ctx| execute_envelope(execution, &output_dtype, ctx),
+            ctx,
+        )
     }
 
     fn validity(&self, _: &Self::Options, _: &Expression) -> VortexResult<Option<Expression>> {
@@ -225,6 +271,7 @@ impl ScalarFnVTable for GeoEnvelope {
 #[cfg(test)]
 mod tests {
     use vortex_array::ArrayRef;
+    use vortex_array::Columnar;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ConstantArray;
@@ -240,6 +287,7 @@ mod tests {
     use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::ScalarFnVTable;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
 
     use super::GeoEnvelope;
     use crate::extension::GeoMetadata;
@@ -492,6 +540,25 @@ mod tests {
         let null_const = ConstantArray::new(Scalar::null(point_dtype), 2).into_array();
         let expected = nullable_rect_column(vec![None, None])?;
         assert_arrays_eq!(boxes(null_const)?, expected, &mut ctx);
+        Ok(())
+    }
+
+    /// A non-null constant is boxed once and retained as a constant output.
+    #[test]
+    fn constant_point_remains_constant() -> VortexResult<()> {
+        let session = crate::test_harness::geo_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let scalar = point_column(vec![1.0], vec![2.0])?.execute_scalar(0, &mut ctx)?;
+        let points = ConstantArray::new(scalar, 3).into_array();
+        let result = boxes(points)?.execute::<Columnar>(&mut ctx)?;
+        let Columnar::Constant(boxes) = result else {
+            return Err(vortex_err!("envelope of a constant should remain constant"));
+        };
+        assert_eq!(boxes.len(), 3);
+
+        let expected = nullable_rect_column(vec![Some((1.0, 2.0, 1.0, 2.0)); 3])?;
+        assert_arrays_eq!(boxes.into_array(), expected, &mut ctx);
         Ok(())
     }
 

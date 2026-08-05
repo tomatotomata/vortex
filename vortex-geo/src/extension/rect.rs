@@ -26,6 +26,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ExtensionArray;
+use vortex_array::arrays::StructArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldNames;
@@ -36,6 +37,7 @@ use vortex_array::dtype::extension::ExtDType;
 use vortex_array::dtype::extension::ExtId;
 use vortex_array::dtype::extension::ExtVTable;
 use vortex_array::scalar::ScalarValue;
+use vortex_array::validity::Validity;
 use vortex_arrow::ArrowExport;
 use vortex_arrow::ArrowExportVTable;
 use vortex_arrow::ArrowImport;
@@ -153,6 +155,24 @@ pub(crate) fn box_dimension(dtype: &DType) -> VortexResult<Dimension> {
     }
     box_dimension_from_names(fields.names())
         .ok_or_else(|| vortex_err!("not a valid geoarrow.box dimension: {:?}", fields.names()))
+}
+
+/// Build a native [`Rect`] array from canonical min/max ordinate columns.
+pub(crate) fn build_rect_array(
+    ext_dtype: &ExtDType<Rect>,
+    corners: Vec<ArrayRef>,
+    len: usize,
+    validity: Validity,
+) -> VortexResult<ArrayRef> {
+    let dimension = box_dimension(ext_dtype.storage_dtype())?;
+    let storage = StructArray::try_new(
+        FieldNames::from(box_field_names(dimension)),
+        corners,
+        len,
+        validity,
+    )?
+    .into_array();
+    Ok(ExtensionArray::try_new(ext_dtype.clone().erased(), storage)?.into_array())
 }
 
 static ARROW_BOX: CachedId = CachedId::new(BoxType::NAME);

@@ -19,11 +19,28 @@ use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::validate_geometry_operands;
-use crate::scalar_fn::execute::execute_null_propagating;
+use crate::extension::is_native_geometry;
+use crate::scalar_fn::execute::execute_binary_geo_types;
+
+/// Validate the two native geometry operands accepted by `ST_Contains`.
+fn validate_contains_operands(dtypes: &[DType]) -> VortexResult<()> {
+    vortex_ensure!(
+        dtypes.len() == 2,
+        "geo: contains requires exactly two geometry operands, got {}",
+        dtypes.len()
+    );
+    for dtype in dtypes {
+        vortex_ensure!(
+            is_native_geometry(dtype),
+            "geo: contains operand {dtype} is not a native geometry type"
+        );
+    }
+    Ok(())
+}
 
 /// OGC `ST_Contains` between two native geometry operands, each a column or a constant
 /// literal: true where operand `b` lies completely inside operand `a` (boundary contact alone
@@ -71,7 +88,7 @@ impl ScalarFnVTable for GeoContains {
     }
 
     fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
-        validate_geometry_operands(dtypes)?;
+        validate_contains_operands(dtypes)?;
         let nullability = Nullability::from(dtypes.iter().any(DType::is_nullable));
         Ok(DType::Bool(nullability))
     }
@@ -87,7 +104,7 @@ impl ScalarFnVTable for GeoContains {
         // Containment is not symmetric: `a` is always the container and `b` the contained. A
         // container's rect must cover the contained's rect (`Rect::contains` is the closed
         // test), so a contained rect poking outside proves the row false.
-        execute_null_propagating(
+        execute_binary_geo_types(
             &a,
             &b,
             |a, b| a.contains(b),

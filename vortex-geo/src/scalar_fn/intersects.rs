@@ -19,11 +19,28 @@ use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::validate_geometry_operands;
-use crate::scalar_fn::execute::execute_null_propagating;
+use crate::extension::is_native_geometry;
+use crate::scalar_fn::execute::execute_binary_geo_types;
+
+/// Validate the two native geometry operands accepted by `ST_Intersects`.
+fn validate_intersects_operands(dtypes: &[DType]) -> VortexResult<()> {
+    vortex_ensure!(
+        dtypes.len() == 2,
+        "geo: intersects requires exactly two geometry operands, got {}",
+        dtypes.len()
+    );
+    for dtype in dtypes {
+        vortex_ensure!(
+            is_native_geometry(dtype),
+            "geo: intersects operand {dtype} is not a native geometry type"
+        );
+    }
+    Ok(())
+}
 
 /// OGC `ST_Intersects` (not disjoint; boundary contact counts) between two native geometry
 /// operands, each a column or a constant literal.
@@ -70,7 +87,7 @@ impl ScalarFnVTable for GeoIntersects {
     }
 
     fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
-        validate_geometry_operands(dtypes)?;
+        validate_intersects_operands(dtypes)?;
         let nullability = Nullability::from(dtypes.iter().any(DType::is_nullable));
         Ok(DType::Bool(nullability))
     }
@@ -85,7 +102,7 @@ impl ScalarFnVTable for GeoIntersects {
         let b = args.get(1)?;
         // Disjoint bounding rects prove the geometries disjoint; rect contact (closed test)
         // falls through to the exact test.
-        execute_null_propagating(
+        execute_binary_geo_types(
             &a,
             &b,
             |x, y| x.intersects(y),
