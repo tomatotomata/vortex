@@ -58,25 +58,38 @@ fn intersection_metadata(left: &GeoMetadata, right: &GeoMetadata) -> VortexResul
     }
 }
 
-/// Resolve the strict native `Polygon x Polygon -> MultiPolygon` overload.
+/// Metadata carried by a validated native polygonal dtype.
+fn polygonal_metadata(dtype: &DType) -> &GeoMetadata {
+    let extension = dtype.as_extension();
+    if extension.is::<Polygon>() {
+        extension.metadata::<Polygon>()
+    } else if extension.is::<MultiPolygon>() {
+        extension.metadata::<MultiPolygon>()
+    } else {
+        unreachable!("intersection operand was validated as polygonal")
+    }
+}
+
+/// Resolve the native polygonal intersection overloads, which always return a MultiPolygon.
 fn intersection_dtype(dtypes: &[DType]) -> VortexResult<ExtDType<MultiPolygon>> {
     vortex_ensure!(
         dtypes.len() == 2,
-        "geo: intersection requires exactly two Polygon operands, got {}",
+        "geo: intersection requires exactly two polygonal operands, got {}",
         dtypes.len()
     );
     for dtype in dtypes {
         vortex_ensure!(
-            dtype
-                .as_extension_opt()
-                .is_some_and(|extension| extension.is::<Polygon>()),
-            "geo: intersection operand {dtype} is not a native Polygon"
+            dtype.as_extension_opt().is_some_and(|extension| {
+                extension.is::<Polygon>() || extension.is::<MultiPolygon>()
+            }),
+            "geo: intersection operand {dtype} is not a native Polygon or MultiPolygon"
         );
     }
 
-    let left = dtypes[0].as_extension();
-    let right = dtypes[1].as_extension();
-    let metadata = intersection_metadata(left.metadata::<Polygon>(), right.metadata::<Polygon>())?;
+    let metadata = intersection_metadata(
+        polygonal_metadata(&dtypes[0]),
+        polygonal_metadata(&dtypes[1]),
+    )?;
     let nullability = Nullability::from(dtypes.iter().any(DType::is_nullable));
     ExtDType::try_new(
         metadata,
@@ -84,20 +97,57 @@ fn intersection_dtype(dtypes: &[DType]) -> VortexResult<ExtDType<MultiPolygon>> 
     )
 }
 
-/// Intersect two decoded polygon values.
-fn intersect(left: &Geometry<f64>, right: &Geometry<f64>) -> GeoMultiPolygon<f64> {
-    let (Geometry::Polygon(left), Geometry::Polygon(right)) = (left, right) else {
-        unreachable!("intersection operands were validated as Polygon")
-    };
-    left.intersection(right)
+/// Dispatch decoded geometry enums to `geo`'s concrete polygonal `BooleanOps` implementations.
+fn polygonal_intersection(left: &Geometry<f64>, right: &Geometry<f64>) -> GeoMultiPolygon<f64> {
+    match (left, right) {
+        (Geometry::Polygon(left), Geometry::Polygon(right)) => left.intersection(right),
+        (Geometry::Polygon(left), Geometry::MultiPolygon(right)) => left.intersection(right),
+        (Geometry::MultiPolygon(left), Geometry::Polygon(right)) => left.intersection(right),
+        (Geometry::MultiPolygon(left), Geometry::MultiPolygon(right)) => left.intersection(right),
+        _ => unreachable!("intersection operands were validated as polygonal"),
+    }
 }
 
-/// Scatter valid intersection results and build their native MultiPolygon array.
-fn build_intersections(
-    intersections: Vec<GeoMultiPolygon<f64>>,
-    execution: &Execution<2>,
+/// Execute intersection after shared binary shape and null dispatch.
+fn execute_intersection(
+    execution: Execution<2>,
     output_dtype: &ExtDType<MultiPolygon>,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
+    let intersections: Vec<GeoMultiPolygon<f64>> = match &execution.operands {
+        [Operand::Constant(left), Operand::Constant(right)] => {
+            let intersection =
+                polygonal_intersection(&single_geometry(left, ctx)?, &single_geometry(right, ctx)?);
+            let one = build_multipolygon_array(
+                &[Some(intersection)],
+                output_dtype.metadata().clone(),
+                execution.nullability,
+            )?;
+            return Ok(ConstantArray::new(one.execute_scalar(0, ctx)?, execution.len).into_array());
+        }
+        [Operand::Constant(left), Operand::Column(right)] => {
+            let left = single_geometry(left, ctx)?;
+            geometries(&right.filter(execution.valid.clone())?, ctx)?
+                .iter()
+                .map(|right| polygonal_intersection(&left, right))
+                .collect()
+        }
+        [Operand::Column(left), Operand::Constant(right)] => {
+            let right = single_geometry(right, ctx)?;
+            geometries(&left.filter(execution.valid.clone())?, ctx)?
+                .iter()
+                .map(|left| polygonal_intersection(left, &right))
+                .collect()
+        }
+        [Operand::Column(left), Operand::Column(right)] => {
+            let left = geometries(&left.filter(execution.valid.clone())?, ctx)?;
+            let right = geometries(&right.filter(execution.valid.clone())?, ctx)?;
+            left.iter()
+                .zip(&right)
+                .map(|(left, right)| polygonal_intersection(left, right))
+                .collect()
+        }
+    };
     let intersections = match execution.valid.indices() {
         AllOr::All => intersections.into_iter().map(Some).collect(),
         AllOr::None => vec![None; execution.len],
@@ -116,56 +166,14 @@ fn build_intersections(
     )
 }
 
-/// Execute intersection after shared binary shape and null dispatch.
-fn execute_intersection(
-    execution: Execution<2>,
-    output_dtype: &ExtDType<MultiPolygon>,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
-    let intersections = match &execution.operands {
-        [Operand::Constant(left), Operand::Constant(right)] => {
-            let intersection =
-                intersect(&single_geometry(left, ctx)?, &single_geometry(right, ctx)?);
-            let one = build_multipolygon_array(
-                &[Some(intersection)],
-                output_dtype.metadata().clone(),
-                execution.nullability,
-            )?;
-            return Ok(ConstantArray::new(one.execute_scalar(0, ctx)?, execution.len).into_array());
-        }
-        [Operand::Constant(left), Operand::Column(right)] => {
-            let left = single_geometry(left, ctx)?;
-            geometries(&right.filter(execution.valid.clone())?, ctx)?
-                .iter()
-                .map(|right| intersect(&left, right))
-                .collect()
-        }
-        [Operand::Column(left), Operand::Constant(right)] => {
-            let right = single_geometry(right, ctx)?;
-            geometries(&left.filter(execution.valid.clone())?, ctx)?
-                .iter()
-                .map(|left| intersect(left, &right))
-                .collect()
-        }
-        [Operand::Column(left), Operand::Column(right)] => {
-            let left = geometries(&left.filter(execution.valid.clone())?, ctx)?;
-            let right = geometries(&right.filter(execution.valid.clone())?, ctx)?;
-            left.iter()
-                .zip(&right)
-                .map(|(left, right)| intersect(left, right))
-                .collect()
-        }
-    };
-    build_intersections(intersections, &execution, output_dtype)
-}
-
-/// Compute the pairwise two-dimensional intersection of native `Polygon` operands as a native
-/// `MultiPolygon`. Disjoint and boundary-only intersections produce an empty `MultiPolygon`.
+/// Compute the pairwise two-dimensional intersection of native `Polygon` or `MultiPolygon`
+/// operands as a native `MultiPolygon`. Disjoint and boundary-only intersections produce an
+/// empty `MultiPolygon`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct GeoIntersection;
 
 impl GeoIntersection {
-    /// A lazy `ScalarFnArray` intersecting two native polygon operands by row.
+    /// A lazy `ScalarFnArray` intersecting two native polygonal operands by row.
     pub fn try_new_array(left: ArrayRef, right: ArrayRef) -> VortexResult<ScalarFnArray> {
         ScalarFnArray::try_new(
             TypedScalarFnInstance::new(GeoIntersection, EmptyOptions).erased(),
@@ -263,6 +271,7 @@ mod tests {
     use crate::extension::MultiPolygon;
     use crate::extension::geometries;
     use crate::scalar_fn::area::GeoArea;
+    use crate::test_harness::multipolygon_column;
     use crate::test_harness::point_column;
     use crate::test_harness::polygon_column;
 
@@ -283,6 +292,14 @@ mod tests {
     ) -> VortexResult<ArrayRef> {
         let scalar = polygon_column(vec![vec![ring]])?.execute_scalar(0, ctx)?;
         Ok(ConstantArray::new(scalar, len).into_array())
+    }
+
+    fn polygonal_column(ring: Vec<(f64, f64)>, multi: bool) -> VortexResult<ArrayRef> {
+        if multi {
+            multipolygon_column(vec![vec![vec![ring]]])
+        } else {
+            polygon_column(vec![vec![ring]])
+        }
     }
 
     #[test]
@@ -315,6 +332,26 @@ mod tests {
 
         let areas = GeoArea::try_new_array(intersections)?.into_array();
         let expected = PrimitiveArray::from_iter([1.0_f64, 0.0, 0.0]).into_array();
+        assert_arrays_eq!(areas, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::polygon_polygon(false, false)]
+    #[case::polygon_multipolygon(false, true)]
+    #[case::multipolygon_polygon(true, false)]
+    #[case::multipolygon_multipolygon(true, true)]
+    fn supports_all_polygonal_combinations(
+        #[case] left_multi: bool,
+        #[case] right_multi: bool,
+    ) -> VortexResult<()> {
+        let left = polygonal_column(square(0.0, 0.0, 2.0, 2.0), left_multi)?;
+        let right = polygonal_column(square(1.0, 1.0, 3.0, 3.0), right_multi)?;
+        let intersections = GeoIntersection::try_new_array(left, right)?.into_array();
+        let areas = GeoArea::try_new_array(intersections)?.into_array();
+        let expected = PrimitiveArray::from_iter([1.0_f64]).into_array();
+        let mut ctx = vortex_array::array_session().create_execution_ctx();
+
         assert_arrays_eq!(areas, expected, &mut ctx);
         Ok(())
     }
@@ -413,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_polygon_input() -> VortexResult<()> {
+    fn rejects_non_polygonal_input() -> VortexResult<()> {
         let polygon = polygon_column(vec![vec![]])?;
         let point = point_column(vec![0.0], vec![0.0])?;
         assert!(GeoIntersection::try_new_array(polygon, point).is_err());
