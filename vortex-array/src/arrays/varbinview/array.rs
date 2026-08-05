@@ -323,8 +323,11 @@ impl VarBinViewData {
     where
         F: Fn(&[u8]) -> bool,
     {
-        let validate_view = |idx: usize, view: &BinaryView| -> VortexResult<()> {
+        let validate_view = |idx: usize, view: &BinaryView, valid: bool| -> VortexResult<()> {
             if view.is_inlined() {
+                if !valid {
+                    return Ok(());
+                }
                 // Validate the inline bytestring
                 let bytes = &view.as_inlined().data[..view.len() as usize];
                 vortex_ensure!(
@@ -354,6 +357,10 @@ impl VarBinViewData {
                     buf.len(),
                 );
 
+                if !valid {
+                    return Ok(());
+                }
+
                 // Make sure the prefix data matches the buffer data.
                 let bytes = &buf[start_offset..end_offset];
                 vortex_ensure!(
@@ -378,17 +385,18 @@ impl VarBinViewData {
                 let mut ctx = legacy_session().create_execution_ctx();
                 let mask = validity.execute_mask(views.len(), &mut ctx)?;
                 for ((idx, view), valid) in views.iter().enumerate().zip(mask.iter()) {
-                    if valid {
-                        validate_view(idx, view)?;
-                    }
+                    validate_view(idx, view, valid)?;
                 }
             }
-            // Every entry is null, so there is nothing to validate.
-            Validity::AllInvalid => {}
+            Validity::AllInvalid => {
+                for (idx, view) in views.iter().enumerate() {
+                    validate_view(idx, view, false)?;
+                }
+            }
             // No nulls: validate every view.
             Validity::NonNullable | Validity::AllValid => {
                 for (idx, view) in views.iter().enumerate() {
-                    validate_view(idx, view)?;
+                    validate_view(idx, view, true)?;
                 }
             }
         }
