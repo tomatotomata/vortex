@@ -22,14 +22,22 @@ use prost::Message;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ExtensionArray;
+use vortex_array::arrays::InterleaveArray;
+use vortex_array::arrays::ListArray;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::StructArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldNames;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::extension::ExtDType;
 use vortex_array::dtype::extension::ExtId;
 use vortex_array::dtype::extension::ExtVTable;
 use vortex_array::scalar::ScalarValue;
+use vortex_array::validity::Validity;
 use vortex_arrow::ArrowExport;
 use vortex_arrow::ArrowExportVTable;
 use vortex_arrow::ArrowImport;
@@ -38,10 +46,12 @@ use vortex_arrow::ArrowSession;
 use vortex_arrow::ArrowSessionExt;
 use vortex_arrow::FromArrowArray;
 use vortex_arrow::FromArrowType;
+use vortex_buffer::Buffer;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
 use vortex_session::registry::CachedId;
 use vortex_session::registry::Id;
@@ -101,6 +111,75 @@ pub(crate) fn linestring_dimension(dtype: &DType) -> VortexResult<Dimension> {
         vortex_bail!("linestring storage must be a List of coordinates, was {dtype}");
     };
     coordinate_dimension(coords)
+}
+
+/// Build one native [`LineString`] per corresponding pair of point coordinate rows.
+pub(crate) fn linestring_array_from_point_pairs(
+    ext_dtype: &ExtDType<LineString>,
+    starts: &StructArray,
+    ends: &StructArray,
+    validity: Validity,
+) -> VortexResult<ArrayRef> {
+    let len = starts.len();
+    vortex_ensure_eq!(
+        len,
+        ends.len(),
+        "geo: line string point columns must have equal lengths"
+    );
+    let vertex_count = len
+        .checked_mul(2)
+        .ok_or_else(|| vortex_err!("geo: two-vertex line string length overflow"))?;
+    let dimension = linestring_dimension(ext_dtype.storage_dtype())?;
+    let start_dimension = coordinate_dimension(starts.dtype())?;
+    let end_dimension = coordinate_dimension(ends.dtype())?;
+
+    let array_indices = PrimitiveArray::from_iter((0..len).flat_map(|_| [0u8, 1])).into_array();
+    let rows = (0..len)
+        .flat_map(|row| [row, row])
+        .map(|row| {
+            u64::try_from(row).map_err(|_| vortex_err!("geo: line string row index overflow"))
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let row_indices = Buffer::from(rows).into_array();
+    let ordinate =
+        |points: &StructArray, point_dimension: Dimension, name: &str| -> VortexResult<ArrayRef> {
+            if point_dimension.field_names().contains(&name) {
+                points.unmasked_field_by_name(name).cloned()
+            } else {
+                Ok(ConstantArray::new(0.0f64, len).into_array())
+            }
+        };
+    let ordinates = dimension
+        .field_names()
+        .iter()
+        .map(|name| {
+            Ok(InterleaveArray::try_new(
+                vec![
+                    ordinate(starts, start_dimension, name)?,
+                    ordinate(ends, end_dimension, name)?,
+                ],
+                array_indices.clone(),
+                row_indices.clone(),
+            )?
+            .into_array())
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let vertices = StructArray::try_new(
+        FieldNames::from(dimension.field_names()),
+        ordinates,
+        vertex_count,
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let offsets = (0..=len)
+        .map(|row| {
+            i32::try_from(row * 2)
+                .map_err(|_| vortex_err!("geo: two-vertex line string offset overflow"))
+        })
+        .collect::<VortexResult<Vec<_>>>()?;
+    let storage =
+        ListArray::try_new(vertices, Buffer::from(offsets).into_array(), validity)?.into_array();
+    Ok(ExtensionArray::try_new(ext_dtype.clone().erased(), storage)?.into_array())
 }
 
 static ARROW_LINESTRING: CachedId = CachedId::new(LineStringType::NAME);

@@ -25,6 +25,8 @@ use crate::scalar_fn::contains::GeoContains;
 use crate::scalar_fn::distance::GeoDistance;
 use crate::scalar_fn::envelope::GeoEnvelope;
 use crate::scalar_fn::intersects::GeoIntersects;
+use crate::scalar_fn::length::GeoLength;
+use crate::scalar_fn::make_line::GeoMakeLine;
 
 pub mod aggregate_fn;
 pub mod extension;
@@ -68,6 +70,8 @@ pub fn initialize(session: &VortexSession) {
     session.scalar_fns().register(GeoContains);
     session.scalar_fns().register(GeoDistance);
     session.scalar_fns().register(GeoIntersects);
+    session.scalar_fns().register(GeoLength);
+    session.scalar_fns().register(GeoMakeLine);
 
     // The axis-aligned bounding-box (AABB) aggregate; self-declares as a per-chunk zone stat for
     // geometry columns.
