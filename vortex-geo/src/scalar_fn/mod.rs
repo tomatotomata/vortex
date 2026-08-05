@@ -10,6 +10,7 @@ pub mod convex_hull;
 pub mod distance;
 pub mod envelope;
 mod execute;
+pub mod intersection;
 pub mod intersects;
 pub mod length;
 pub mod make_line;
