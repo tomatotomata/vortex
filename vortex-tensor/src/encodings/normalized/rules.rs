@@ -11,6 +11,7 @@ use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_error::VortexResult;
 
 use crate::encodings::normalized::Normalized;
+use crate::encodings::normalized::array::NormalizedArrayExt;
 use crate::encodings::normalized::array::NormalizedArraySlotsExt;
 
 pub(super) const RULES: ParentRuleSet<Normalized> = ParentRuleSet::new(&[
@@ -37,12 +38,13 @@ impl ArrayParentReduceRule<Normalized> for NormalizedSliceRule {
     ) -> VortexResult<Option<ArrayRef>> {
         let range = parent.slice_range();
 
-        // SAFETY: Slicing both children preserves their structure.
+        // SAFETY: Slicing both children and the validity preserves their structure.
         Ok(Some(
             unsafe {
                 Normalized::new_unchecked(
                     array.normalized().slice(range.clone())?,
                     array.norms().slice(range.clone())?,
+                    array.normalized_validity().slice(range.clone())?,
                 )
             }
             .into_array(),
@@ -69,12 +71,14 @@ impl ArrayParentReduceRule<Normalized> for NormalizedFilterRule {
     ) -> VortexResult<Option<ArrayRef>> {
         let mask = parent.filter_mask();
 
-        // SAFETY: Filtering both children with the same mask preserves their structure.
+        // SAFETY: Filtering both children and the validity with the same mask preserves their
+        // structure.
         Ok(Some(
             unsafe {
                 Normalized::new_unchecked(
                     array.normalized().filter(mask.clone())?,
                     array.norms().filter(mask.clone())?,
+                    array.normalized_validity().filter(mask)?,
                 )
             }
             .into_array(),

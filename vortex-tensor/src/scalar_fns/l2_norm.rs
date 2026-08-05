@@ -11,6 +11,7 @@ use vortex_array::IntoArray;
 use vortex_array::arrays::Constant;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ExtensionArray;
+use vortex_array::arrays::MaskedArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::ScalarFn as ScalarFnArrayEncoding;
 use vortex_array::arrays::ScalarFnArray;
@@ -35,6 +36,7 @@ use vortex_array::scalar_fn::ScalarFnId;
 use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -44,6 +46,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::encodings::normalized::Normalized;
+use crate::encodings::normalized::NormalizedArrayExt;
 use crate::matcher::AnyTensor;
 use crate::utils::extract_flat_elements;
 use crate::utils::extract_normalized_children;
@@ -131,8 +134,15 @@ impl ScalarFnVTable for L2Norm {
         // L2Norm over a `Normalized`-encoded column is defined to read back the authoritative stored
         // norms. Callers of lossy encodings opt into that storage semantics instead of forcing a
         // decode-and-recompute path here.
-        if input_ref.is::<Normalized>() {
+        //
+        // The stored norms are non-nullable — nulls live on the `Normalized` array itself — so a
+        // nullable input needs its null map reattached to reach `norm_dtype`.
+        if let Some(normalized_array) = input_ref.as_opt::<Normalized>() {
             let (_, norms) = extract_normalized_children(&input_ref);
+            let norms = match normalized_array.normalized_validity() {
+                Validity::NonNullable => norms,
+                validity => MaskedArray::try_new(norms, validity)?.into_array(),
+            };
             vortex_ensure_eq!(norms.dtype(), &norm_dtype);
             return Ok(norms);
         }
@@ -275,11 +285,13 @@ mod tests {
     use vortex_array::validity::Validity;
     use vortex_error::VortexResult;
 
+    use crate::encodings::normalized::Normalized;
     use crate::scalar_fns::l2_norm::L2Norm;
     use crate::tests::SESSION;
     use crate::types::vector::Vector;
     use crate::utils::test_helpers::assert_close;
     use crate::utils::test_helpers::literal_vector_array;
+    use crate::utils::test_helpers::normalized_array;
     use crate::utils::test_helpers::tensor_array;
     use crate::utils::test_helpers::vector_array;
 
@@ -405,6 +417,44 @@ mod tests {
             constant.dtype(),
             &DType::Primitive(PType::F64, Nullability::Nullable)
         );
+        Ok(())
+    }
+
+    /// The read-through returns the stored norms child, which is always non-nullable — nulls live
+    /// on the [`Normalized`] array itself. A nullable input therefore needs its null map reattached
+    /// to reach the declared return dtype, which used to be an assertion failure instead.
+    #[test]
+    fn reads_through_a_nullable_normalized_column() -> VortexResult<()> {
+        let normalized = vector_array(2, &[0.6f64, 0.8, 1.0, 0.0])?;
+        let norms = PrimitiveArray::from_iter([5.0f64, 1.0]).into_array();
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let validity = Validity::from_iter([true, false]);
+        let input = Normalized::try_new(normalized, norms, validity, &mut ctx)?.into_array();
+
+        let result = ScalarFnArray::try_new(L2Norm::new().erased(), vec![input])?.into_array();
+        let prim: PrimitiveArray = result.execute(&mut ctx)?;
+
+        assert_eq!(
+            prim.dtype(),
+            &DType::Primitive(PType::F64, Nullability::Nullable)
+        );
+        assert!(prim.is_valid(0, &mut ctx)?);
+        assert!(!prim.is_valid(1, &mut ctx)?);
+        assert_close(&[prim.as_slice::<f64>()[0]], &[5.0]);
+
+        Ok(())
+    }
+
+    /// A non-nullable [`Normalized`] column reads straight back as the stored norms child, with no
+    /// masking wrapper in the way.
+    #[test]
+    fn reads_through_a_non_nullable_normalized_column() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let input = normalized_array(&[2], &[0.6, 0.8, 1.0, 0.0], &[5.0, 3.0], &mut ctx)?;
+
+        assert_close(&eval_l2_norm(input)?, &[5.0, 3.0]);
+
         Ok(())
     }
 

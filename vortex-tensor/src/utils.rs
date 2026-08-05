@@ -370,9 +370,9 @@ pub mod test_helpers {
         ConstantArray::new(ext_scalar, len).into_array()
     }
 
-    /// Creates a [`Normalized`] array from pre-normalized tensor elements and matching norms. The
-    /// caller must ensure every row of `normalized_elements` is unit-norm or zero, since this
-    /// goes through the checked constructor.
+    /// Creates a non-nullable [`Normalized`] array from pre-normalized tensor elements and matching
+    /// norms. The caller must ensure every row of `normalized_elements` is unit-norm or zero, since
+    /// this goes through the checked constructor.
     pub fn normalized_array<T: NativePType>(
         shape: &[usize],
         normalized_elements: &[T],
@@ -382,7 +382,8 @@ pub mod test_helpers {
         let normalized = tensor_array(shape, normalized_elements)?;
         let norms =
             PrimitiveArray::new(Buffer::copy_from(norms), Validity::NonNullable).into_array();
-        Ok(Normalized::try_new(normalized, norms, ctx)?.into_array())
+
+        Ok(Normalized::try_new(normalized, norms, Validity::NonNullable, ctx)?.into_array())
     }
 
     /// Asserts that each element in `actual` is within `1e-10` of the corresponding `expected`

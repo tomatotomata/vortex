@@ -21,7 +21,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         &"vortex.patched",
         &"vortex.tensor.cosine_similarity",
         &"vortex.tensor.inner_product",
-        &"vortex.tensor.normalized",
         &"vortex.tensor.l2_norm",
+        &"vortex.tensor.normalized",
     ],
 };

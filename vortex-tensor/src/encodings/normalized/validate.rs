@@ -8,7 +8,9 @@ use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::Nullability;
 use vortex_array::match_each_float_ptype;
+use vortex_array::validity::Validity;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -18,7 +20,7 @@ use crate::utils::extract_flat_elements;
 use crate::utils::unit_norm_tolerance;
 use crate::utils::validate_tensor_float_input;
 
-/// Validates the structural invariants of a [`Normalized`] array's children.
+/// Validates the structural invariants of a [`Normalized`] array's slots.
 ///
 /// These are the cheap, dtype-and-length checks that every [`NormalizedArray`] upholds, whichever
 /// constructor built it. They run on construction and on deserialization.
@@ -28,6 +30,7 @@ use crate::utils::validate_tensor_float_input;
 pub(super) fn validate_normalized_children(
     normalized: &ArrayRef,
     norms: &ArrayRef,
+    validity: Option<&ArrayRef>,
     dtype: &DType,
     len: usize,
 ) -> VortexResult<()> {
@@ -47,27 +50,44 @@ pub(super) fn validate_normalized_children(
     let tensor_match = validate_tensor_float_input(normalized.dtype())?;
     let element_ptype = tensor_match.element_ptype();
 
-    let DType::Primitive(norms_ptype, _) = norms.dtype() else {
-        vortex_bail!(
-            "Normalized norms must be a primitive float array, got {}",
-            norms.dtype(),
-        );
-    };
+    // Both children are non-nullable so that the array's validity is the column's only null
+    // record, which is what lets the decode and read-through paths skip dtype widening entirely.
     vortex_ensure_eq!(
-        *norms_ptype,
-        element_ptype,
-        "Normalized norms dtype must match the normalized element dtype ({element_ptype}), \
-         got {norms_ptype}",
+        *normalized.dtype(),
+        dtype.as_nonnullable(),
+        "Normalized normalized child must be the non-nullable array dtype ({}), got {}",
+        dtype.as_nonnullable(),
+        normalized.dtype(),
     );
 
-    let expected = normalized
-        .dtype()
-        .union_nullability(norms.dtype().nullability());
+    let expected_norms_dtype = DType::Primitive(element_ptype, Nullability::NonNullable);
     vortex_ensure_eq!(
-        *dtype,
-        expected,
-        "Normalized dtype must be the union of its children's nullability ({expected}), got {dtype}",
+        *norms.dtype(),
+        expected_norms_dtype,
+        "Normalized norms must be a non-nullable {element_ptype} column ({expected_norms_dtype}), \
+         got {}",
+        norms.dtype(),
     );
+
+    if let Some(validity) = validity {
+        vortex_ensure!(
+            dtype.is_nullable(),
+            "Normalized must not carry a validity slot when its dtype is non-nullable ({dtype})",
+        );
+        vortex_ensure_eq!(
+            *validity.dtype(),
+            Validity::DTYPE,
+            "Normalized validity must be a {} column, got {}",
+            Validity::DTYPE,
+            validity.dtype(),
+        );
+        vortex_ensure_eq!(
+            validity.len(),
+            len,
+            "Normalized validity must have the array length ({len}), got {}",
+            validity.len(),
+        );
+    }
 
     Ok(())
 }
@@ -75,16 +95,26 @@ pub(super) fn validate_normalized_children(
 /// Validates that `normalized` and (when supplied) the matching `norms` jointly satisfy the
 /// semantic [`Normalized`] invariants:
 ///
-/// - Every valid row of `normalized` has L2 norm `1.0` or `0.0`, within the tolerance implied by
-///   the element precision.
-/// - When `norms` is supplied, every stored norm is non-negative and any row whose stored norm is
-///   `0.0` is exactly the zero vector in `normalized`.
+/// - Every row of `normalized` has L2 norm `1.0` or `0.0`, within the tolerance implied by the
+///   element precision.
+/// - When `norms` is supplied, every stored norm is non-negative, and a row is the zero vector in
+///   `normalized` exactly when its stored norm is `0.0`.
 ///
-/// This costs `O(len * list_size)`, which is why it is a separate step rather than part of the
-/// encoding's structural validation.
+/// The second half is symmetric on purpose. Checking only one direction would accept
+/// `normalized = [0.0, 0.0]` paired with `norms = [5.0]`, which decodes to `[0.0, 0.0]` while
+/// [`L2Norm`] reads the stored `5.0` straight back — precisely the split that
+/// [`Normalized::try_new`] promises is lossless.
+///
+/// This scans every row, so it costs `O(len * list_size)`, which is why it is a separate step
+/// rather than part of the encoding's structural validation. Rows a caller intends to be null are
+/// scanned too; [`normalize`] zeroes both children at null positions, which satisfies both
+/// directions of the zero-norm rule.
 ///
 /// [`Normalized`]: crate::encodings::normalized::Normalized
-pub fn validate_l2_normalized_rows_against_norms(
+/// [`Normalized::try_new`]: crate::encodings::normalized::Normalized::try_new
+/// [`normalize`]: crate::encodings::normalized::normalize
+/// [`L2Norm`]: crate::scalar_fns::l2_norm::L2Norm
+pub fn validate_normalized_rows(
     normalized: &ArrayRef,
     norms: Option<&ArrayRef>,
     ctx: &mut ExecutionCtx,
@@ -123,29 +153,15 @@ pub fn validate_l2_normalized_rows_against_norms(
     }
 
     let normalized: ExtensionArray = normalized.clone().execute(ctx)?;
-    let normalized_validity = normalized.as_ref().validity()?;
-
     let flat = extract_flat_elements(normalized.storage_array(), tensor_flat_size, ctx)?;
     let norms = norms
         .map(|norms| norms.clone().execute::<PrimitiveArray>(ctx))
         .transpose()?;
 
-    let combined_validity = match &norms {
-        Some(norms) => normalized_validity.and(norms.validity()?)?,
-        None => normalized_validity,
-    };
-
-    // Resolve validity to a mask once rather than probing it per row.
-    let combined_valid = combined_validity.execute_mask(row_count, ctx)?;
-
     match_each_float_ptype!(element_ptype, |T| {
         let stored_norms = norms.as_ref().map(|norms| norms.as_slice::<T>());
 
         for i in 0..row_count {
-            if !combined_valid.value(i) {
-                continue;
-            }
-
             let (row_norm_sq, is_zero_row) =
                 flat.row::<T>(i)
                     .iter()
@@ -168,12 +184,13 @@ pub fn validate_l2_normalized_rows_against_norms(
                     "Normalized norms must be non-negative, but row {i} has {stored_norm_f64:.6}",
                 );
 
-                if stored_norm_f64 == 0.0 {
-                    vortex_ensure!(
-                        is_zero_row,
-                        "Normalized normalized child must be all zeros when norms row {i} is 0.0",
-                    );
-                }
+                vortex_ensure!(
+                    is_zero_row == (stored_norm_f64 == 0.0),
+                    "Normalized normalized child must be all zeros exactly when its stored norm is \
+                     0.0, but row {i} pairs a {} normalized row with a stored norm of \
+                     {stored_norm_f64:.6}",
+                    if is_zero_row { "zero" } else { "nonzero" },
+                );
             }
         }
     });
