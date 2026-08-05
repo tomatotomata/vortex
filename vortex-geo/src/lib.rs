@@ -21,6 +21,7 @@ use crate::extension::Rect;
 use crate::extension::WellKnownBinary;
 use crate::prune::GeoDistancePrune;
 use crate::prune::GeoIntersectsPrune;
+use crate::scalar_fn::area::GeoArea;
 use crate::scalar_fn::contains::GeoContains;
 use crate::scalar_fn::distance::GeoDistance;
 use crate::scalar_fn::envelope::GeoEnvelope;
@@ -66,6 +67,7 @@ pub fn initialize(session: &VortexSession) {
     session.arrow().register_importer(Arc::new(Rect));
 
     // Register the geometry scalar functions.
+    session.scalar_fns().register(GeoArea);
     session.scalar_fns().register(GeoEnvelope);
     session.scalar_fns().register(GeoContains);
     session.scalar_fns().register(GeoDistance);
