@@ -25,8 +25,8 @@ use vortex_array::vtable::child_to_validity;
 use vortex_array::vtable::validity_to_child;
 use vortex_array::vtable::with_empty_buffers;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
-use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -254,19 +254,17 @@ impl VTable for Normalized {
         let normalized = children.get(0, &normalized_dtype, len)?;
         let norms = children.get(1, &norms_dtype, len)?;
 
-        // An absent validity child means "no nulls"; the parent's nullability is what distinguishes
+        // An absent validity child means "no nulls". The parent's nullability is what distinguishes
         // `NonNullable` from `AllValid`.
-        let validity = if children.len() == NormalizedSlots::COUNT {
-            Validity::Array(children.get(NormalizedSlots::VALIDITY, &Validity::DTYPE, len)?)
-        } else {
-            vortex_ensure_eq!(
-                children.len(),
-                DATA_CHILDREN,
-                "NormalizedArray expects {DATA_CHILDREN} or {} children, got {}",
+        let validity = match children.len() {
+            DATA_CHILDREN => Validity::from(dtype.nullability()),
+            NormalizedSlots::COUNT => {
+                Validity::Array(children.get(NormalizedSlots::VALIDITY, &Validity::DTYPE, len)?)
+            }
+            other => vortex_bail!(
+                "Normalized expects {DATA_CHILDREN} or {} children, got {other}",
                 NormalizedSlots::COUNT,
-                children.len(),
-            );
-            Validity::from(dtype.nullability())
+            ),
         };
 
         Ok(normalized_parts(normalized, norms, validity))
