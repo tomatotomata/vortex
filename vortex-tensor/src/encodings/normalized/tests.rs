@@ -729,6 +729,42 @@ fn serialization_carries_no_metadata() -> VortexResult<()> {
     Ok(())
 }
 
+/// `validity_to_child` writes no child for `AllValid`, so a nullable column with no null rows
+/// serializes with only its two data children and the parent dtype is all that is left to recover
+/// the nullability from. The constant fast path reaches this state whenever the input dtype is
+/// nullable but its stored row is not null.
+#[test]
+fn serde_round_trip_of_a_nullable_column_with_no_null_rows() -> VortexResult<()> {
+    let normalized = vector_array(2, &[0.6f64, 0.8, 1.0, 0.0])?;
+    let norms = PrimitiveArray::from_iter([5.0f64, 1.0]).into_array();
+
+    let mut ctx = SESSION.create_execution_ctx();
+    let original =
+        Normalized::try_new(normalized, norms, Validity::AllValid, &mut ctx)?.into_array();
+    let children: Vec<ArrayRef> = original.children();
+
+    assert!(original.dtype().is_nullable());
+    assert_eq!(children.len(), NormalizedSlots::COUNT - 1);
+
+    let metadata = SESSION
+        .array_serialize(&original)?
+        .expect("Normalized must serialize");
+    let recovered = ArrayPlugin::deserialize(
+        &Normalized,
+        original.dtype(),
+        original.len(),
+        &metadata,
+        &[],
+        &children,
+        &SESSION,
+    )?;
+
+    assert_eq!(recovered.dtype(), original.dtype());
+    assert!(matches!(recovered.validity()?, Validity::AllValid));
+
+    Ok(())
+}
+
 #[test]
 fn serde_round_trip_preserves_the_stored_validity() -> VortexResult<()> {
     let normalized = vector_array(2, &[0.6f64, 0.8, 1.0, 0.0])?;
