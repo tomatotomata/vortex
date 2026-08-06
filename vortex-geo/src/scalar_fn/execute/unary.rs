@@ -92,13 +92,17 @@ where
                 )
                 .into_array())
             }
-            [Operand::Column(array)] => eval_column(
-                &array,
-                &execution.valid,
-                compute,
-                execution.nullability,
-                ctx,
-            ),
+            [Operand::Column(array)] => {
+                let valid = execution.valid.execute_mask(execution.len, ctx)?;
+                if execution.len != 0 && valid.all_false() {
+                    return Ok(ConstantArray::new(
+                        Scalar::null(T::dtype(execution.nullability)),
+                        execution.len,
+                    )
+                    .into_array());
+                }
+                eval_column(&array, &valid, compute, execution.nullability, ctx)
+            }
         },
         ctx,
     )

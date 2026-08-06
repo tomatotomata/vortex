@@ -133,12 +133,16 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ConstantArray;
+    use vortex_array::arrays::MaskedArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
     use vortex_array::scalar_fn::EmptyOptions;
     use vortex_array::scalar_fn::ScalarFnVTable;
+    use vortex_array::validity::Validity;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
 
@@ -208,6 +212,30 @@ mod tests {
         };
         assert_eq!(lengths.len(), 2);
         assert!(lengths.scalar().is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_rows_propagate_without_decoding_null_geometries() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+        let lines = MaskedArray::try_new(
+            linestring_column(vec![
+                vec![(0.0, 0.0), (3.0, 4.0)],
+                vec![(0.0, 0.0), (1.0, 1.0)],
+                vec![(0.0, 0.0), (0.0, 4.0)],
+            ])?,
+            Validity::from_iter([true, false, true]),
+        )?
+        .into_array();
+
+        let expected = PrimitiveArray::new(
+            vec![5.0, 0.0, 4.0],
+            Validity::from_iter([true, false, true]),
+        )
+        .into_array();
+        let lengths = GeoLength::try_new_array(lines)?.into_array();
+        assert_arrays_eq!(lengths, expected, &mut ctx);
         Ok(())
     }
 
