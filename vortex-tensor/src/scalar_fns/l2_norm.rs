@@ -46,7 +46,6 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::encodings::normalized::Normalized;
-use crate::encodings::normalized::NormalizedArrayExt;
 use crate::matcher::AnyTensor;
 use crate::utils::extract_flat_elements;
 use crate::utils::extract_normalized_children;
@@ -135,11 +134,11 @@ impl ScalarFnVTable for L2Norm {
         // norms. Callers of lossy encodings opt into that storage semantics instead of forcing a
         // decode-and-recompute path here.
         //
-        // The stored norms are non-nullable — nulls live on the `Normalized` array itself — so a
-        // nullable input needs its null map reattached to reach `norm_dtype`.
-        if let Some(normalized_array) = input_ref.as_opt::<Normalized>() {
+        // The stored norms are non-nullable, because nulls live on the `Normalized` array itself, so
+        // a nullable input needs its null map reattached to reach `norm_dtype`.
+        if input_ref.is::<Normalized>() {
             let (_, norms) = extract_normalized_children(&input_ref);
-            let norms = match normalized_array.normalized_validity() {
+            let norms = match input_ref.validity()? {
                 Validity::NonNullable => norms,
                 validity => MaskedArray::try_new(norms, validity)?.into_array(),
             };
@@ -420,9 +419,9 @@ mod tests {
         Ok(())
     }
 
-    /// The read-through returns the stored norms child, which is always non-nullable — nulls live
-    /// on the [`Normalized`] array itself. A nullable input therefore needs its null map reattached
-    /// to reach the declared return dtype, which used to be an assertion failure instead.
+    /// The read-through returns the stored norms child, which is always non-nullable because nulls
+    /// live on the [`Normalized`] array itself. A nullable input therefore needs its null map
+    /// reattached to reach the declared return dtype, which used to be an assertion failure.
     #[test]
     fn reads_through_a_nullable_normalized_column() -> VortexResult<()> {
         let normalized = vector_array(2, &[0.6f64, 0.8, 1.0, 0.0])?;

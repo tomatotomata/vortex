@@ -72,7 +72,7 @@ pub(super) fn validate_normalized_children(
     if let Some(validity) = validity {
         vortex_ensure!(
             dtype.is_nullable(),
-            "Normalized must not carry a validity slot when its dtype is non-nullable ({dtype})",
+            "Normalized must only carry a validity slot when its dtype is nullable, got {dtype}",
         );
         vortex_ensure_eq!(
             *validity.dtype(),
@@ -102,7 +102,7 @@ pub(super) fn validate_normalized_children(
 ///
 /// The second half is symmetric on purpose. Checking only one direction would accept
 /// `normalized = [0.0, 0.0]` paired with `norms = [5.0]`, which decodes to `[0.0, 0.0]` while
-/// [`L2Norm`] reads the stored `5.0` straight back — precisely the split that
+/// [`L2Norm`] reads the stored `5.0` straight back, which is precisely the split that
 /// [`Normalized::try_new`] promises is lossless.
 ///
 /// This scans every row, so it costs `O(len * list_size)`, which is why it is a separate step

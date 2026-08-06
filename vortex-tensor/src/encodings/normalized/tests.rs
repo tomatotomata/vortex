@@ -32,7 +32,6 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 
 use crate::encodings::normalized::Normalized;
-use crate::encodings::normalized::NormalizedArrayExt;
 use crate::encodings::normalized::NormalizedArraySlotsExt;
 use crate::encodings::normalized::NormalizedScheme;
 use crate::encodings::normalized::NormalizedSlots;
@@ -149,7 +148,14 @@ fn decodes_fixed_shape_tensors() -> VortexResult<()> {
 
 #[test]
 fn decodes_null_rows_from_the_stored_validity() -> VortexResult<()> {
-    let normalized = vector_array(2, &[0.6, 0.8, 0.0, 0.0, 1.0, 0.0])?;
+    let normalized = vector_array(
+        2,
+        &[
+            0.6, 0.8, // row 0, decodes to [3.0, 4.0]
+            0.0, 0.0, // row 1, null and zeroed
+            1.0, 0.0, // row 2, decodes to [2.0, 0.0]
+        ],
+    )?;
     let norms = PrimitiveArray::from_iter([5.0f64, 0.0, 2.0]).into_array();
 
     let mut ctx = SESSION.create_execution_ctx();
@@ -170,7 +176,14 @@ fn decodes_null_rows_from_the_stored_validity() -> VortexResult<()> {
 /// Both children are non-nullable, so the stored validity is the column's only null record.
 #[test]
 fn validity_comes_from_the_stored_null_map() -> VortexResult<()> {
-    let normalized = vector_array(2, &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0])?;
+    let normalized = vector_array(
+        2,
+        &[
+            1.0, 0.0, // row 0
+            1.0, 0.0, // row 1
+            1.0, 0.0, // row 2
+        ],
+    )?;
     let norms = PrimitiveArray::from_iter([1.0f64, 1.0, 1.0]).into_array();
 
     let mut ctx = SESSION.create_execution_ctx();
@@ -254,7 +267,7 @@ fn constant_nonunit_norms_scale_fixed_shape_tensors() -> VortexResult<()> {
 
 /// Regression: the constant-norms paths have to reach the array's nullability starting from a
 /// non-nullable `normalized` child. The identity path (`norm == 1.0`) and the bulk-multiply path
-/// get there by different routes, so both need covering — the multiply path used to widen the FSL
+/// get there by different routes, so both need covering. The multiply path used to widen the FSL
 /// elements and panic on `ExtensionArray::new`.
 #[rstest]
 #[case::unit_norm(1.0)]
@@ -477,7 +490,14 @@ fn normalize_zeroes_rows_with_zero_norms() -> VortexResult<()> {
 fn normalize_moves_input_nulls_onto_the_array() -> VortexResult<()> {
     // Row 1 is masked out but physically holds the unit vector `[1.0, 0.0]`, so a norm of 1.0 would
     // survive into the norms child if the null were not applied.
-    let input = vector_array(2, &[3.0, 4.0, 1.0, 0.0, 0.0, 1.0])?;
+    let input = vector_array(
+        2,
+        &[
+            3.0, 4.0, // row 0, norm 5.0
+            1.0, 0.0, // row 1, masked out despite being unit-norm
+            0.0, 1.0, // row 2, norm 1.0
+        ],
+    )?;
     let input = MaskedArray::try_new(input, Validity::from_iter([true, false, true]))?.into_array();
 
     let mut ctx = SESSION.create_execution_ctx();
@@ -488,7 +508,8 @@ fn normalize_moves_input_nulls_onto_the_array() -> VortexResult<()> {
     assert!(!normalized_array.norms().dtype().is_nullable());
 
     let mask = normalized_array
-        .normalized_validity()
+        .as_ref()
+        .validity()?
         .execute_mask(3, &mut ctx)?;
     assert!(mask.value(0));
     assert!(!mask.value(1));
@@ -737,7 +758,7 @@ fn serde_round_trip_preserves_the_stored_validity() -> VortexResult<()> {
     assert!(!recovered.normalized().dtype().is_nullable());
     assert!(!recovered.norms().dtype().is_nullable());
 
-    let mask = recovered.normalized_validity().execute_mask(2, &mut ctx)?;
+    let mask = recovered.as_ref().validity()?.execute_mask(2, &mut ctx)?;
     assert!(mask.value(0));
     assert!(!mask.value(1));
 

@@ -77,7 +77,7 @@ pub type NormalizedArray = Array<Normalized>;
 /// # Lossy normalized children
 ///
 /// [`new_unchecked`](Self::new_unchecked) deliberately skips the semantic scan so that
-/// `normalized` may be an *approximation* of the unit-norm direction, such as a quantized child.
+/// `normalized` may be an _approximation_ of the unit-norm direction, such as a quantized child.
 /// The stored norms stay authoritative in that case, and the read-through rules in
 /// [`L2Norm`], [`InnerProduct`], and [`CosineSimilarity`] are defined against the stored children
 /// rather than against decoded coordinates. Those operators may therefore return slightly
@@ -180,21 +180,6 @@ fn normalized_parts(
     ArrayParts::new(Normalized, dtype, len, EmptyArrayData).with_slots(slots)
 }
 
-/// Accessors for [`NormalizedArray`] that are derived from its slots rather than being one.
-pub trait NormalizedArrayExt: NormalizedArraySlotsExt {
-    /// The column's validity.
-    ///
-    /// Both children are non-nullable, so this is the array's complete null information.
-    fn normalized_validity(&self) -> Validity {
-        child_to_validity(
-            self.as_ref().slots()[NormalizedSlots::VALIDITY].as_ref(),
-            self.as_ref().dtype().nullability(),
-        )
-    }
-}
-
-impl<T: NormalizedArraySlotsExt> NormalizedArrayExt for T {}
-
 impl VTable for Normalized {
     type TypedArrayData = EmptyArrayData;
 
@@ -293,7 +278,7 @@ impl VTable for Normalized {
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let dtype = array.dtype().clone();
-        let validity = array.normalized_validity();
+        let validity = array.validity()?;
         let row_count = array.len();
         let slots = array.slots_view();
 
@@ -319,7 +304,11 @@ impl VTable for Normalized {
 
 impl ValidityVTable<Normalized> for Normalized {
     fn validity(array: ArrayView<'_, Normalized>) -> VortexResult<Validity> {
-        Ok(array.normalized_validity())
+        // Both children are non-nullable, so the slot is the column's complete null information.
+        Ok(child_to_validity(
+            array.slots_view().validity,
+            array.dtype().nullability(),
+        ))
     }
 }
 

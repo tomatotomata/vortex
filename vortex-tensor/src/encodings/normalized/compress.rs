@@ -38,7 +38,6 @@ use vortex_error::VortexResult;
 
 use crate::encodings::normalized::Normalized;
 use crate::encodings::normalized::NormalizedArray;
-use crate::encodings::normalized::NormalizedArrayExt;
 use crate::encodings::normalized::NormalizedArraySlotsExt;
 use crate::encodings::normalized::NormalizedSlots;
 use crate::encodings::normalized::array::DATA_CHILDREN;
@@ -117,10 +116,9 @@ impl Scheme for NormalizedScheme {
         )?;
 
         // SAFETY: Cascading preserves the split's child lengths and dtypes.
-        Ok(unsafe {
-            Normalized::new_unchecked(normalized, norms, normalized_array.normalized_validity())
-        }
-        .into_array())
+        let validity = normalized_array.validity()?;
+
+        Ok(unsafe { Normalized::new_unchecked(normalized, norms, validity) }.into_array())
     }
 }
 
@@ -133,7 +131,7 @@ impl Scheme for NormalizedScheme {
 ///
 /// Rows that are null in the original input are **zeroed out** in both children. Null rows may
 /// carry undefined physical storage values, and we do not want that garbage propagating into
-/// downstream lossy encodings of the normalized child — nor into the read-through operators, which
+/// downstream lossy encodings of the normalized child, nor into the read-through operators, which
 /// consume the norms buffer densely.
 ///
 /// # Nullability

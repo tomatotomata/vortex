@@ -29,9 +29,9 @@ use crate::utils::extract_flat_elements;
 
 /// Reconstructs the original tensor column by scaling each normalized row by its stored norm.
 ///
-/// `dtype` is the parent [`NormalizedArray`]'s dtype and `validity` its null map, so the
-/// reconstructed column carries the parent's nullability rather than either child's — both children
-/// are non-nullable.
+/// `dtype` is the parent [`NormalizedArray`]'s dtype and `validity` its null map. Both children are
+/// non-nullable, so the reconstructed column carries the parent's nullability rather than either
+/// child's.
 ///
 /// [`NormalizedArray`]: crate::encodings::normalized::NormalizedArray
 pub(super) fn denormalize(
@@ -91,12 +91,18 @@ fn denormalize_constant_norms(
         .as_f64()
         .vortex_expect("norms are validated to be a float column, so the scalar fits in f64");
 
-    // Only an exact `1.0` is the identity. Skipping the multiply for a merely *near*-unit norm
+    // Only an exact `1.0` is the identity. Skipping the multiply for a merely _near_-unit norm
     // would leave this path disagreeing with the general one in the last bits, and `scalar_at`
-    // routes every row through here — so a per-row read would answer differently than a bulk decode
+    // routes every row through here, so a per-row read would answer differently than a bulk decode
     // of the same column.
+    //
+    // The `normalized` child is non-nullable, so a nullable parent needs its null map put back
+    // before the child can stand in for the decoded column.
     if norm_value == 1.0 {
-        return apply_validity(normalized.clone(), validity);
+        return match validity {
+            Validity::NonNullable => Ok(normalized.clone()),
+            validity => Ok(MaskedArray::try_new(normalized.clone(), validity)?.into_array()),
+        };
     }
 
     let normalized: ExtensionArray = normalized.clone().execute(ctx)?;
@@ -112,17 +118,6 @@ fn denormalize_constant_norms(
     };
 
     Ok(ExtensionArray::new(dtype.as_extension().clone(), storage.into_array()).into_array())
-}
-
-/// Attaches the parent's `validity` to an array that stands in for the decoded column unchanged.
-///
-/// The `normalized` child is non-nullable, so a nullable parent needs its null map put back before
-/// the child can be returned as-is.
-fn apply_validity(array: ArrayRef, validity: Validity) -> VortexResult<ArrayRef> {
-    match validity {
-        Validity::NonNullable => Ok(array),
-        validity => Ok(MaskedArray::try_new(array, validity)?.into_array()),
-    }
 }
 
 /// Rebuilds a tensor-like extension array from flat primitive elements.

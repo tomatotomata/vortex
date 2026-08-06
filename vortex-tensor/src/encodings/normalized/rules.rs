@@ -11,7 +11,6 @@ use vortex_array::optimizer::rules::ParentRuleSet;
 use vortex_error::VortexResult;
 
 use crate::encodings::normalized::Normalized;
-use crate::encodings::normalized::array::NormalizedArrayExt;
 use crate::encodings::normalized::array::NormalizedArraySlotsExt;
 
 pub(super) const RULES: ParentRuleSet<Normalized> = ParentRuleSet::new(&[
@@ -44,7 +43,7 @@ impl ArrayParentReduceRule<Normalized> for NormalizedSliceRule {
                 Normalized::new_unchecked(
                     array.normalized().slice(range.clone())?,
                     array.norms().slice(range.clone())?,
-                    array.normalized_validity().slice(range.clone())?,
+                    array.validity()?.slice(range.clone())?,
                 )
             }
             .into_array(),
@@ -78,7 +77,7 @@ impl ArrayParentReduceRule<Normalized> for NormalizedFilterRule {
                 Normalized::new_unchecked(
                     array.normalized().filter(mask.clone())?,
                     array.norms().filter(mask.clone())?,
-                    array.normalized_validity().filter(mask)?,
+                    array.validity()?.filter(mask)?,
                 )
             }
             .into_array(),

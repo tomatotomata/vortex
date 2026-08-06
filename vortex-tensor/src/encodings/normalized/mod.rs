@@ -30,7 +30,6 @@
 mod array;
 pub use array::Normalized;
 pub use array::NormalizedArray;
-pub use array::NormalizedArrayExt;
 pub use array::NormalizedArraySlotsExt;
 pub use array::NormalizedSlots;
 
