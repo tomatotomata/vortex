@@ -31,11 +31,14 @@ pub(crate) enum Operand {
 }
 
 /// Shared batch state presented to a null-propagating geometry kernel with `N` operands.
-pub(crate) struct Execution<const N: usize> {
+///
+/// Binary kernels use the default materialized [`Mask`]. Unary columnar kernels can instead
+/// retain a lazy [`vortex_array::validity::Validity`] until they need row-wise access.
+pub(crate) struct Execution<const N: usize, V = Mask> {
     /// Constant/column shape of each operand.
     pub(crate) operands: [Operand; N],
-    /// Rows where every operand is valid.
-    pub(crate) valid: Mask,
+    /// Validity state required by the kernel.
+    pub(crate) valid: V,
     /// Number of output rows.
     pub(crate) len: usize,
     /// Output nullability from the scalar function's return dtype.

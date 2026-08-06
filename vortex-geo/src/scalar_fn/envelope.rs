@@ -19,6 +19,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::extension::ExtDType;
 use vortex_array::expr::Expression;
+use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::Arity;
 use vortex_array::scalar_fn::ChildName;
 use vortex_array::scalar_fn::EmptyOptions;
@@ -140,7 +141,7 @@ fn row_boxes(
 /// Compute boxes directly over a non-constant native geometry column.
 fn envelope_array(
     array: ArrayRef,
-    valid: &Mask,
+    validity: Validity,
     output_dtype: &ExtDType<Rect>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
@@ -163,22 +164,24 @@ fn envelope_array(
             .iter()
             .map(|name| coords.unmasked_field_by_name(name).cloned())
             .collect::<VortexResult<Vec<_>>>()?;
-        (
-            corners,
-            Validity::from_mask(valid.clone(), Nullability::Nullable),
-        )
+        (corners, validity.into_nullable())
     } else if !storage.dtype().is_list() {
         // Point storage is the coordinate `Struct` itself: every row owns exactly one
         // coordinate, so its box is degenerate and the corner columns are zero-copy projections.
         let coords = storage.execute::<StructArray>(ctx)?;
         let x = coords.unmasked_field_by_name("x")?.clone();
         let y = coords.unmasked_field_by_name("y")?.clone();
-        (
-            vec![x.clone(), y.clone(), x, y],
-            Validity::from_mask(valid.clone(), Nullability::Nullable),
-        )
+        (vec![x.clone(), y.clone(), x, y], validity.into_nullable())
     } else {
-        row_boxes(storage, valid, ctx)?
+        let valid = validity.execute_mask(len, ctx)?;
+        if len != 0 && valid.all_false() {
+            return Ok(ConstantArray::new(
+                Scalar::null(DType::Extension(output_dtype.clone().erased())),
+                len,
+            )
+            .into_array());
+        }
+        row_boxes(storage, &valid, ctx)?
     };
 
     build_rect_array(output_dtype, corners, len, output_validity)
@@ -186,17 +189,17 @@ fn envelope_array(
 
 /// Execute `envelope` after shared constant/column and null dispatch.
 fn execute_envelope(
-    execution: Execution<1>,
+    execution: Execution<1, Validity>,
     output_dtype: &ExtDType<Rect>,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     match execution.operands {
         [Operand::Constant(scalar)] => {
             let one = ConstantArray::new(scalar, 1).into_array();
-            let output = envelope_array(one, &Mask::new_true(1), output_dtype, ctx)?;
+            let output = envelope_array(one, Validity::AllValid, output_dtype, ctx)?;
             Ok(ConstantArray::new(output.execute_scalar(0, ctx)?, execution.len).into_array())
         }
-        [Operand::Column(array)] => envelope_array(array, &execution.valid, output_dtype, ctx),
+        [Operand::Column(array)] => envelope_array(array, execution.valid, output_dtype, ctx),
     }
 }
 
