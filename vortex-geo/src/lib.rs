@@ -27,6 +27,7 @@ use crate::scalar_fn::contains::GeoContains;
 use crate::scalar_fn::convex_hull::GeoConvexHull;
 use crate::scalar_fn::distance::GeoDistance;
 use crate::scalar_fn::envelope::GeoEnvelope;
+use crate::scalar_fn::hilbert::GeoHilbert;
 use crate::scalar_fn::intersection::GeoIntersection;
 use crate::scalar_fn::intersects::GeoIntersects;
 use crate::scalar_fn::length::GeoLength;
@@ -76,6 +77,7 @@ pub fn initialize(session: &VortexSession) {
     session.scalar_fns().register(GeoEnvelope);
     session.scalar_fns().register(GeoContains);
     session.scalar_fns().register(GeoDistance);
+    session.scalar_fns().register(GeoHilbert);
     session.scalar_fns().register(GeoIntersects);
     session.scalar_fns().register(GeoIntersection);
     session.scalar_fns().register(GeoLength);
