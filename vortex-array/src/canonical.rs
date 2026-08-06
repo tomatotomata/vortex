@@ -50,6 +50,7 @@ use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
 use crate::arrays::listview::ListViewDataParts;
 use crate::arrays::listview::ListViewRebuildMode;
 use crate::arrays::map::MapArrayExt;
+use crate::arrays::map::MapArraySlotsExt;
 use crate::arrays::primitive::PrimitiveDataParts;
 use crate::arrays::struct_::StructDataParts;
 use crate::arrays::union::UnionDataParts;
@@ -293,6 +294,7 @@ impl Canonical {
                 array.map_dtype().clone(),
                 array
                     .entries()
+                    .as_::<ListView>()
                     .into_owned()
                     .rebuild(ListViewRebuildMode::TrimElements, ctx)?,
             ))),
@@ -707,14 +709,10 @@ impl Executable for CanonicalValidity {
             }
             Canonical::Map(map) => {
                 let map_dtype = map.map_dtype().clone();
-                let entries = map.entries().into_owned();
+                let entries = map.entries().clone();
                 Ok(CanonicalValidity(Canonical::Map(MapArray::new(
                     map_dtype,
-                    entries
-                        .into_array()
-                        .execute::<CanonicalValidity>(ctx)?
-                        .0
-                        .into_listview(),
+                    entries.execute::<CanonicalValidity>(ctx)?.0.into_listview(),
                 ))))
             }
             Canonical::FixedSizeList(fsl) => {
@@ -893,11 +891,10 @@ impl Executable for RecursiveCanonical {
             }
             Canonical::Map(map) => {
                 let map_dtype = map.map_dtype().clone();
-                let entries = map.entries().into_owned();
+                let entries = map.entries().clone();
                 Ok(RecursiveCanonical(Canonical::Map(MapArray::new(
                     map_dtype,
                     entries
-                        .into_array()
                         .execute::<RecursiveCanonical>(ctx)?
                         .0
                         .into_listview(),

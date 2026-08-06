@@ -202,6 +202,27 @@ def test_read_latest_baseline_rows_streams_latest_matching_benchmark_commit(tmp_
     assert len(selected) == 2
 
 
+def test_read_latest_baseline_rows_uses_last_result_from_rerun(tmp_path: Path) -> None:
+    compare = load_compare_module()
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        "".join(
+            f"{json.dumps(row)}\n"
+            for row in [
+                stored_timing_row("base", "tpch_q01/datafusion:parquet", 100),
+                stored_timing_row("base", "tpch_q01/datafusion:parquet", 110),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pr = pd.DataFrame([stored_timing_row("pr", "tpch_q01/datafusion:parquet", 105)])
+
+    selected = compare.read_latest_baseline_rows(history_path, pr)
+
+    assert len(selected) == 1
+    assert selected.iloc[0]["value"] == 110
+
+
 def test_within_engine_analysis_uses_each_engines_own_parquet_control() -> None:
     compare = load_compare_module()
     rows = [
@@ -218,6 +239,48 @@ def test_within_engine_analysis_uses_each_engines_own_parquet_control() -> None:
     assert set(analyses) == {"datafusion", "duckdb"}
     assert compare.build_verdict(analyses["datafusion"])["impact"] == "-10.0%"
     assert compare.build_verdict(analyses["duckdb"])["impact"] == "+20.0%"
+
+
+def test_random_access_attribution_excludes_lance_rows() -> None:
+    compare = load_compare_module()
+    rows = [
+        timing_row("random-access/taxi/correlated/parquet-tokio-local-disk", 100, 110),
+        timing_row("random-access/taxi/correlated/vortex-tokio-local-disk", 100, 99),
+        timing_row("random-access/taxi/correlated/lance-tokio-local-disk", 100, 200),
+        timing_row("random-access/taxi/uniform/parquet-tokio-local-disk", 100, 110),
+        timing_row("random-access/taxi/uniform/vortex-tokio-local-disk", 100, 99),
+        timing_row("random-access/taxi/uniform/lance-tokio-local-disk", 100, 200),
+    ]
+    df = pd.DataFrame(rows)
+    df[["engine", "file_format", "query"]] = df["name"].apply(compare.extract_target_fields)
+
+    analyses = compare.build_within_engine_statistical_analyses(df, threshold_pct=5)
+
+    assert df.loc[df["file_format"] == "lance", "query"].isna().all()
+    assert set(analyses) == {"random-access"}
+    assert set(analyses["random-access"]["detail_df"]["file_format"]) == {
+        "parquet",
+        "vortex-file-compressed",
+    }
+    assert compare.build_verdict(analyses["random-access"])["status"] == "Likely improvement"
+
+
+def test_random_access_report_keeps_lance_details_without_attribution(tmp_path: Path) -> None:
+    names_and_values = [
+        ("random-access/taxi/correlated/parquet-tokio-local-disk", 110),
+        ("random-access/taxi/correlated/vortex-tokio-local-disk", 99),
+        ("random-access/taxi/correlated/lance-tokio-local-disk", 200),
+        ("random-access/taxi/uniform/parquet-tokio-local-disk", 110),
+        ("random-access/taxi/uniform/vortex-tokio-local-disk", 99),
+        ("random-access/taxi/uniform/lance-tokio-local-disk", 200),
+    ]
+    base_rows = [stored_timing_row("base-sha", name, 100) for name, _pr_value in names_and_values]
+    pr_rows = [stored_timing_row("pr-sha", name, pr_value) for name, pr_value in names_and_values]
+
+    report = render_report(tmp_path, base_rows, pr_rows, "Random Access")
+
+    assert "**Attributed Vortex impact**: -10.0%" in report
+    assert "<summary>random-access / lance / ns " in report
 
 
 def test_comparison_report_groups_by_target_and_unit(tmp_path: Path) -> None:
@@ -348,6 +411,31 @@ def test_file_size_report_reads_shared_benchmark_rows() -> None:
 
     assert "<summary>File Size Changes (1 files changed, +25.0% overall, 1↑ 0↓)</summary>" in report
     assert "| part-0.vortex | 10 | vortex-file-compressed | 100 B | 125 B | +25 B | +25.0% |" in report
+
+
+def test_file_size_report_ignores_file_identities_with_a_zero_byte_side() -> None:
+    compare = load_compare_module()
+
+    report = compare.format_file_size_report(
+        pd.DataFrame(
+            [
+                file_size_record_for("base-sha", 100, "tpch", "10", "vortex-file-compressed", "head-empty"),
+                file_size_record_for("base-sha", 0, "tpch", "10", "vortex-file-compressed", "base-empty"),
+                file_size_record_for("base-sha", 100, "tpch", "10", "vortex-file-compressed", "changed"),
+            ]
+        ),
+        pd.DataFrame(
+            [
+                file_size_record_for("pr-sha", 0, "tpch", "10", "vortex-file-compressed", "head-empty"),
+                file_size_record_for("pr-sha", 125, "tpch", "10", "vortex-file-compressed", "base-empty"),
+                file_size_record_for("pr-sha", 125, "tpch", "10", "vortex-file-compressed", "changed"),
+            ]
+        ),
+    )
+
+    assert "<summary>File Size Changes (1 files changed, +25.0% overall, 1↑ 0↓)</summary>" in report
+    assert "head-empty" not in report
+    assert "base-empty" not in report
 
 
 def test_file_size_report_ignores_baseline_rows_outside_pr_scope() -> None:

@@ -218,16 +218,20 @@ uv run --project bench-orchestrator vx-bench run tpch \
 
 Benchmarks run automatically on all commits to `develop` and can be run on-demand for PRs:
 
-- **Post-commit** -- compression, random access, and SQL benchmarks run on every commit to
-  `develop`, with results uploaded for historical tracking.
-- **PR benchmarks** -- triggered by the `action/benchmark` label. Results are compared against
-  the latest `develop` run and posted as a PR comment.
-- **GPU compression benchmarks** -- triggered by the `action/benchmark-gpu-compress` label. Runs
-  the allow-listed Vortex decompression cases on a GPU runner and posts the timings as a PR comment.
-- **SQL benchmarks** -- triggered by the `action/benchmark-sql` label. Runs the base SQL matrix,
-  which excludes Appian, TPC-H SF=10 on S3, `vortex-compact`, and `duckdb:duckdb`.
-- **Full SQL benchmarks** -- triggered by the `action/benchmark-sql-full` label. Runs the full
-  SQL matrix of suites, engines, formats, and storage backends (NVMe, S3).
+- **Post-commit** -- compression, string encoding, random access, and SQL benchmarks run on every
+  commit to `develop`, with results uploaded for historical tracking.
+- **Random access** -- `action/bench-random-access` runs only the random-access benchmark.
+- **Compression** -- `action/bench-compress` runs only the compression benchmark.
+- **String encoding** -- `action/bench-string` runs only the string encoding benchmark.
+- **GPU compression** -- `action/bench-gpu-compress` runs the allow-listed Vortex decompression
+  cases on a GPU runner.
+- **SQL** -- `action/bench-sql` runs the `pr` preset, which excludes `vortex-compact`.
+- **SQL Compact** -- `action/bench-sql-compact` runs the `pr-compact` preset, which benchmarks
+  `vortex-compact` plus Parquet control rows used to distinguish code changes from runner drift.
+- **All CPU benchmarks** -- `action/bench-all` runs random access, compression, string encoding,
+  and the `pr-all` SQL preset, which combines the `pr` and `pr-compact` coverage without
+  repeating shared jobs. Do not combine it with other benchmark labels; GPU compression is the
+  only exception.
 
 All CI benchmarks run on dedicated instances with the `release_debug` profile and
 `-C target-cpu=native` to produce representative numbers.

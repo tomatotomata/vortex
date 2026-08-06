@@ -45,6 +45,8 @@ use crate::object_store::resolve::ResolvedStore;
 use crate::object_store::resolve::resolve_store;
 #[cfg(feature = "opendal")]
 use crate::opendal_store::CosStore;
+#[cfg(feature = "opendal")]
+use crate::opendal_store::GoosefsStore;
 use crate::session::session;
 
 pub(crate) fn init(py: Python, parent: &Bound<PyModule>) -> PyResult<()> {
@@ -145,13 +147,16 @@ pub fn read_url<'py>(
 /// A store object accepted by `read_url` / `write`.
 ///
 /// This recognizes both the built-in `pyo3-object_store` classes (S3, Azure, GCS, HTTP,
-/// Local, Memory) and Vortex's own OpenDAL-backed classes (`CosStore`).
+/// Local, Memory) and Vortex's own OpenDAL-backed classes (`CosStore`, `GoosefsStore`).
 pub(crate) enum AnyVortexStore {
     /// A store extracted from one of the built-in `pyo3-object_store` classes.
     Builtin(PyObjectStore),
     /// Vortex's OpenDAL-backed COS store.
     #[cfg(feature = "opendal")]
     Cos(CosStore),
+    /// Vortex's OpenDAL-backed GooseFS store.
+    #[cfg(feature = "opendal")]
+    Goosefs(GoosefsStore),
 }
 
 impl AnyVortexStore {
@@ -161,6 +166,8 @@ impl AnyVortexStore {
             AnyVortexStore::Builtin(s) => s.into_inner(),
             #[cfg(feature = "opendal")]
             AnyVortexStore::Cos(s) => s.to_arc(),
+            #[cfg(feature = "opendal")]
+            AnyVortexStore::Goosefs(s) => s.to_arc(),
         }
     }
 }
@@ -176,8 +183,12 @@ impl<'py> FromPyObject<'_, 'py> for AnyVortexStore {
         if let Ok(cos) = obj.extract::<CosStore>() {
             return Ok(AnyVortexStore::Cos(cos));
         }
+        #[cfg(feature = "opendal")]
+        if let Ok(goosefs) = obj.extract::<GoosefsStore>() {
+            return Ok(AnyVortexStore::Goosefs(goosefs));
+        }
         Err(PyTypeError::new_err(
-            "Expected an object store instance (S3/Azure/GCS/HTTP/Local/Memory/COS/OSS store)",
+            "Expected an object store instance (S3/Azure/GCS/HTTP/Local/Memory/COS/OSS/GooseFS store)",
         ))
     }
 }
@@ -303,7 +314,7 @@ impl PyVortexWriteOptions {
     /// >>> vx.io.VortexWriteOptions.default().write(sprl, "chonky.vortex")
     /// >>> import os
     /// >>> os.path.getsize('chonky.vortex')
-    /// 215900
+    /// 215932
     ///
     /// Wow, Vortex manages to use about two bytes per integer! So advanced. So tiny.
     ///
@@ -313,7 +324,7 @@ impl PyVortexWriteOptions {
     ///
     /// >>> vx.io.VortexWriteOptions.compact().write(sprl, "tiny.vortex")
     /// >>> os.path.getsize('tiny.vortex')
-    /// 55028
+    /// 55060
     ///
     /// Random numbers are not (usually) composed of random bytes!
     #[staticmethod]

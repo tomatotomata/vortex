@@ -60,6 +60,8 @@ pub mod filter;
 pub use filter::Filter;
 pub use filter::FilterArray;
 
+pub(crate) mod fixed_width;
+
 pub mod fixed_size_list;
 pub use fixed_size_list::FixedSizeList;
 pub use fixed_size_list::FixedSizeListArray;
@@ -143,6 +145,7 @@ pub(crate) fn initialize(session: &VortexSession) {
     fixed_size_list::initialize(session);
     list::initialize(session);
     listview::initialize(session);
+    map::initialize(session);
     patched::initialize(session);
     primitive::initialize(session);
     struct_::initialize(session);
