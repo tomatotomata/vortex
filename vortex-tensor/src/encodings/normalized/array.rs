@@ -161,15 +161,16 @@ impl Normalized {
 
 /// Assembles the [`ArrayParts`] shared by both constructors and by deserialization.
 ///
-/// The array's dtype is the `normalized` child's dtype widened by whatever nullability `validity`
-/// implies, which is the only place the parent's nullability comes from.
+/// The array's dtype is the `normalized` child's dtype carrying whatever nullability `validity`
+/// implies. `validity` is the sole source of the array's nullability, as it is for every canonical
+/// container, so a nullable child cannot quietly widen the parent.
 fn normalized_parts(
     normalized: ArrayRef,
     norms: ArrayRef,
     validity: Validity,
 ) -> ArrayParts<Normalized> {
     let len = normalized.len();
-    let dtype = normalized.dtype().union_nullability(validity.nullability());
+    let dtype = normalized.dtype().with_nullability(validity.nullability());
     let slots = NormalizedSlots {
         normalized,
         norms,
