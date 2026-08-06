@@ -202,7 +202,7 @@ fn geometry_keys(
 }
 
 fn execute_hilbert(
-    execution: Execution<1>,
+    execution: Execution<1, Validity>,
     bounds: [f64; 4],
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
