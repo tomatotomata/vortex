@@ -17,6 +17,7 @@ use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::extension::ExtensionArrayExt;
 use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
+use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
@@ -157,35 +158,34 @@ pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Normal
     let norms_array: ArrayRef = L2Norm
         .try_new_array(row_count, EmptyOptions, [input.clone()])?
         .execute(ctx)?;
-    let primitive_norms: PrimitiveArray = norms_array.execute(ctx)?;
 
     // `L2Norm` propagates the input's validity, so this is the column's null map.
-    let validity = primitive_norms.validity()?;
+    let validity = norms_array.validity()?;
+
+    // Filling the nulls with zero is what moves them off the child, and it leaves the row loop
+    // below a single rule to follow: a zero norm means a zeroed row. A non-nullable input makes
+    // this a cast rather than a copy.
+    let element_dtype = DType::Primitive(tensor_match.element_ptype(), Nullability::NonNullable);
+    let norms: PrimitiveArray = norms_array
+        .fill_null(Scalar::zero_value(&element_dtype))?
+        .execute(ctx)?;
 
     let input: ExtensionArray = input.execute(ctx)?;
     let normalized_dtype = input.dtype().as_nonnullable();
     let flat = extract_flat_elements(input.storage_array(), tensor_flat_size, ctx)?;
 
-    // Resolve validity to a mask once rather than probing it per row (each `Validity::is_valid`
-    // executes a scalar for array-backed validity).
-    let valid = validity.execute_mask(row_count, ctx)?;
-
-    let (normalized, norms) = match_each_float_ptype!(flat.ptype(), |T| {
-        let norm_values = primitive_norms.as_slice::<T>();
+    let normalized = match_each_float_ptype!(flat.ptype(), |T| {
+        let norm_values = norms.as_slice::<T>();
 
         let total_elements = row_count * tensor_flat_size;
         let mut elements = BufferMut::<T>::with_capacity(total_elements);
-        let mut norms = BufferMut::<T>::with_capacity(row_count);
         for i in 0..row_count {
-            // A null row's stored values are undefined, so its computed norm is meaningless. Zero
-            // both children there instead of storing whatever the garbage happened to produce.
-            let norm = if valid.value(i) {
-                norm_values[i]
-            } else {
-                T::zero()
-            };
-            norms.push(norm);
+            let norm = norm_values[i];
 
+            // A null row arrives here with a filled zero norm, so its coordinates are zeroed
+            // alongside the genuine zero vectors rather than carrying whatever the masked-out
+            // storage happened to hold.
+            //
             // SAFETY: We allocated `row_count * tensor_flat_size` capacity and push exactly
             // `tensor_flat_size` elements per row.
             if norm == T::zero() {
@@ -197,21 +197,16 @@ pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Normal
             }
         }
 
-        let normalized = build_normalized(
+        build_normalized(
             normalized_dtype,
             tensor_flat_size,
             row_count,
             elements.freeze(),
-        )?;
-
-        // SAFETY: The buffer length equals `row_count`, and the norms child is non-nullable.
-        let norms = unsafe { PrimitiveArray::new_unchecked(norms.freeze(), Validity::NonNullable) };
-
-        VortexResult::Ok((normalized, norms.into_array()))
+        )
     })?;
 
     // SAFETY: The normalized rows, norms ptype, and child lengths come directly from this split.
-    Ok(unsafe { Normalized::new_unchecked(normalized, norms, validity) })
+    Ok(unsafe { Normalized::new_unchecked(normalized, norms.into_array(), validity) })
 }
 
 /// Attempts to build a [`NormalizedArray`] whose two children are both [`ConstantArray`]s by
