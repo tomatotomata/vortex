@@ -159,16 +159,28 @@ pub fn normalize(input: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Normal
         .try_new_array(row_count, EmptyOptions, [input.clone()])?
         .execute(ctx)?;
 
-    // `L2Norm` propagates the input's validity, so this is the column's null map.
-    let validity = norms_array.validity()?;
+    // Canonicalize before reading the validity so the norms are computed once. Taking the validity
+    // off the unexecuted array instead leaves the norms to be evaluated again below, which costs
+    // the whole `L2Norm` pass a second time and grows with the tensor width.
+    let primitive_norms: PrimitiveArray = norms_array.execute(ctx)?;
 
-    // Filling the nulls with zero is what moves them off the child, and it leaves the row loop
-    // below a single rule to follow: a zero norm means a zeroed row. A non-nullable input makes
-    // this a cast rather than a copy.
-    let element_dtype = DType::Primitive(tensor_match.element_ptype(), Nullability::NonNullable);
-    let norms: PrimitiveArray = norms_array
-        .fill_null(Scalar::zero_value(&element_dtype))?
-        .execute(ctx)?;
+    // `L2Norm` propagates the input's validity, so this is the column's null map.
+    let validity = primitive_norms.validity()?;
+
+    // Filling the nulls with zero moves them off the child and leaves the row loop below a single
+    // rule to follow: a zero norm means a zeroed row. A column with no nulls has nothing to fill,
+    // and `fill_null` still charges it a cast, so skip it there.
+    let norms: PrimitiveArray = if validity.nullability().is_nullable() {
+        let element_dtype =
+            DType::Primitive(tensor_match.element_ptype(), Nullability::NonNullable);
+
+        primitive_norms
+            .into_array()
+            .fill_null(Scalar::zero_value(&element_dtype))?
+            .execute(ctx)?
+    } else {
+        primitive_norms
+    };
 
     let input: ExtensionArray = input.execute(ctx)?;
     let normalized_dtype = input.dtype().as_nonnullable();
