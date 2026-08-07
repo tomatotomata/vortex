@@ -360,7 +360,7 @@ impl ExecutionArgs for VecExecutionArgs {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EmptyOptions;
 impl Display for EmptyOptions {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
