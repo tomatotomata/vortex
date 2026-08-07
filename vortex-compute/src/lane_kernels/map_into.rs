@@ -5,7 +5,6 @@
 //! caller-provided `&mut [MaybeUninit<R>]`.
 
 use std::mem::MaybeUninit;
-use std::ops::BitOrAssign;
 
 use vortex_buffer::BitBuffer;
 
@@ -216,58 +215,6 @@ pub trait IndexedSourceExt: IndexedSource + Sized {
         if remainder != 0 {
             words[full] = chunk(&values, &mut f, full * 64, remainder);
         }
-    }
-
-    /// Split value/failure map with **no validity awareness at all**: write every lane's value
-    /// unconditionally and OR-reduce its failure evidence into the return.
-    ///
-    /// The fastest checked shape, running at the speed of the unchecked [`map_into`] in exchange
-    /// for reporting only _that_ some lane failed and never exiting early. Re-run the now known
-    /// cold input through [`try_map_into`] or [`try_map_masked_into`] to attribute the failure or
-    /// to drop the null-lane ones. The evidence reduces inside the kernel because a captured `&mut`
-    /// becomes a loop-carried memory dependence that blocks vectorization.
-    ///
-    /// Anything other than [`Default`] means failure, and `bool` is the ordinary `Fail`. Wider
-    /// words exist for operations where deriving a `bool` costs the vectorization it guards.
-    /// **`Fail` must be no wider than `R`**, asserted below, or the reduction rather than the
-    /// operation decides how many lanes fit in a vector.
-    ///
-    /// [`map_into`]: IndexedSourceExt::map_into
-    /// [`try_map_into`]: IndexedSourceExt::try_map_into
-    /// [`try_map_masked_into`]: IndexedSourceExt::try_map_masked_into
-    ///
-    /// # Panics
-    ///
-    /// Panics if `out.len() != self.len()`.
-    #[inline]
-    fn map_checked_into<R, Fail, Apply>(self, out: &mut [MaybeUninit<R>], mut apply: Apply) -> Fail
-    where
-        Fail: Copy + Default + BitOrAssign,
-        Apply: FnMut(Self::Item) -> (R, Fail),
-    {
-        const {
-            assert!(
-                size_of::<Fail>() <= size_of::<R>(),
-                "failure evidence must be no wider than the value, or it bounds the vector width"
-            )
-        };
-
-        let values = self;
-        let len = values.len();
-        assert_eq!(out.len(), len, "out must have the same length as values");
-
-        let mut failed = Fail::default();
-        for idx in 0..len {
-            // SAFETY: idx < len by the loop bound, and out.len() == len.
-            let val = unsafe { values.get_unchecked(idx) };
-
-            let (result, failure) = apply(val);
-            failed |= failure;
-
-            // SAFETY: idx < len == out.len().
-            unsafe { out.get_unchecked_mut(idx).write(result) };
-        }
-        failed
     }
 
     /// Fallible map with **no validity awareness at all** — every `None` returned
@@ -597,26 +544,6 @@ mod tests {
             (v <= u32::MAX as u64).then_some(v as u32)
         });
         assert!(res.is_ok(), "null lane should bypass the range check");
-    }
-
-    #[test]
-    fn map_checked_into_writes_all_lanes_and_reduces_flag() {
-        let mut values: Vec<u64> = (0..130).collect();
-        let mut out = vec![MaybeUninit::<u32>::uninit(); 130];
-        let failed = values
-            .as_slice()
-            .map_checked_into(&mut out, |v| (v as u32, v > u32::MAX as u64));
-        assert!(!failed);
-        assert_eq!(write_t(out), (0..130u32).collect::<Vec<_>>());
-
-        values[77] = (u32::MAX as u64) + 1;
-        let mut out = vec![MaybeUninit::<u32>::uninit(); 130];
-        let failed = values
-            .as_slice()
-            .map_checked_into(&mut out, |v| (v as u32, v > u32::MAX as u64));
-        assert!(failed);
-        // Failing lanes still write their (wrapped) value.
-        assert_eq!(write_t(out)[76], 76);
     }
 
     #[test]

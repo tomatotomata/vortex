@@ -1,65 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_buffer::Buffer;
-use vortex_compute::lane_kernels::IndexedSource;
-use vortex_compute::lane_kernels::LaneZip;
-use vortex_error::VortexResult;
-use vortex_error::vortex_err;
-use vortex_mask::Mask;
+//! The checked arithmetic one row of a primitive column is computed with.
+//!
+//! Each operator is a type implementing [`CheckedPrimitiveOp`] at every native width, and each
+//! width implements [`CheckedArithmetic`] with the value and failure evidence written separately.
+//! Keeping them apart is what lets [`row`](super::row) write a value for every row and reduce the
+//! evidence without a branch, so the loop vectorizes.
 
-use super::checked::Failure;
-use super::checked::checked_apply_lanes;
-use super::checked::checked_lanes;
-use crate::ArrayRef;
-use crate::ExecutionCtx;
-use crate::IntoArray;
-use crate::arrays::Constant;
-use crate::arrays::ConstantArray;
-use crate::arrays::PrimitiveArray;
-use crate::builtins::ArrayBuiltins;
-use crate::dtype::DType;
 use crate::dtype::NativePType;
-use crate::dtype::PType;
 use crate::dtype::half::f16;
-use crate::match_each_native_ptype;
-use crate::scalar::NumericOperator;
-use crate::scalar::Scalar;
-use crate::validity::Validity;
+use crate::scalar_fn::SinkResult;
 
-struct CheckedAdd;
+/// Checked addition, failing on integer overflow.
+pub(super) struct CheckedAdd;
 
-struct CheckedSub;
+/// Checked subtraction, failing on integer overflow.
+pub(super) struct CheckedSub;
 
-struct CheckedMul;
+/// Checked multiplication, failing on integer overflow.
+pub(super) struct CheckedMul;
 
-struct CheckedDiv;
+/// Checked division, failing on integer division by zero and on `MIN / -1`.
+pub(super) struct CheckedDiv;
 
-trait CheckedPrimitiveOp<T: NativePType>: Sized {
-    /// Message for the error raised when this operation fails on a valid lane.
+/// Evidence that some row failed, in a form that OR-reduces across the batch.
+///
+/// A plain `bool` is the obvious choice and the right one for most operations. Unsigned
+/// multiplication is the exception: deriving a `bool` from the widened product costs a comparison,
+/// and LLVM rewrites that comparison plus the product into `llvm.umul.with.overflow`, which has no
+/// vector form and scalarizes the whole loop. Carrying the discarded high half instead means the row
+/// never compares, so the multiply stays a widening vector multiply and the reduction stays a
+/// vector OR. **The width must not exceed the element's**, or the reduction becomes the loop's
+/// bottleneck instead of the arithmetic.
+pub(super) trait Failure: SinkResult<Accumulated = Self> + Copy + Default {}
+
+impl<T: SinkResult<Accumulated = T> + Copy + Default> Failure for T {}
+
+/// One arithmetic operator at one width, as a value and its failure evidence.
+///
+/// The pair rather than an `Option<T>` is what a row can write unconditionally: the value is stored
+/// whatever the evidence says, and a failing row is either masked away as null or turned into a
+/// batch error before anything reads it.
+pub(super) trait CheckedPrimitiveOp<T: NativePType>: 'static + Sized {
+    /// The error reported for a batch in which some valid row failed.
     const ERROR: &'static str;
 
-    /// Whether to check inside the value loop and exit early, rather than reducing evidence over
-    /// the whole batch and re-running only once some lane has flagged.
-    const CHECKED_VALUE_LOOP: bool = false;
-
-    /// How this operation reports a failing lane. See [`Failure`].
+    /// How this operation reports a failing row. See [`Failure`].
     type Failure: Failure;
 
-    /// Compute a lane's value and its failure evidence together.
-    ///
-    /// Overflowing-style rather than `Option<T>`, so the vectorizable kernels can write every
-    /// lane's value unconditionally and reduce the evidence separately. [`Self::checked`] is the
-    /// shape for the scalar and early-exit paths.
+    /// The result of this operation, paired with evidence of whether the row failed.
     fn apply(lhs: T, rhs: T) -> (T, Self::Failure);
-
-    /// [`Self::apply`] folded into the `Option` that the early-exit kernels take.
-    #[inline(always)]
-    fn checked(lhs: T, rhs: T) -> Option<T> {
-        let (value, failed) = Self::apply(lhs, rhs);
-
-        (failed == Self::Failure::default()).then_some(value)
-    }
 }
 
 impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedAdd {
@@ -97,12 +88,6 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedMul {
 
 impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedDiv {
     const ERROR: &'static str = "integer division by zero or overflow in checked div";
-    // Integer division still lowers to scalar divides, so the split
-    // value/error-scan loop used to auto-vectorize add/sub/mul only adds a
-    // second full scan. Use the one-pass early-exit checked kernel for integer
-    // division, matching Arrow/Velox. Float division has no checked errors and
-    // stays on the split/vectorizable default path.
-    const CHECKED_VALUE_LOOP: bool = T::DIV_CHECKS_IN_VALUE_LOOP;
 
     type Failure = bool;
 
@@ -116,206 +101,21 @@ impl<T: CheckedArithmetic> CheckedPrimitiveOp<T> for CheckedDiv {
         };
         (value, failed)
     }
-
-    #[inline(always)]
-    fn checked(lhs: T, rhs: T) -> Option<T> {
-        lhs.div_checked(rhs)
-    }
 }
 
-/// Execute a numeric operation between two primitive-typed arrays.
-pub(super) fn execute_numeric_primitive(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
-    op: NumericOperator,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
-    let ptype = PType::try_from(lhs.dtype())?;
-
-    match_each_native_ptype!(ptype, |T| {
-        match op {
-            NumericOperator::Add => execute_checked_typed::<T, CheckedAdd>(lhs, rhs, ctx),
-            NumericOperator::Sub => execute_checked_typed::<T, CheckedSub>(lhs, rhs, ctx),
-            NumericOperator::Mul => execute_checked_typed::<T, CheckedMul>(lhs, rhs, ctx),
-            NumericOperator::Div => execute_checked_typed::<T, CheckedDiv>(lhs, rhs, ctx),
-        }
-    })
-}
-
-fn execute_checked_typed<T, Op>(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef>
-where
-    T: NativePType,
-    Op: CheckedPrimitiveOp<T>,
-    Scalar: From<T>,
-    Scalar: From<Option<T>>,
-{
-    let result_dtype = lhs
-        .dtype()
-        .with_nullability(lhs.dtype().nullability() | rhs.dtype().nullability());
-    let lhs = PrimitiveOperand::<T>::try_new(lhs, ctx)?;
-    let rhs = PrimitiveOperand::<T>::try_new(rhs, ctx)?;
-    let len = lhs.len();
-    debug_assert_eq!(len, rhs.len());
-
-    let validity = lhs.validity().and(rhs.validity())?;
-    let valid_rows = validity.execute_mask(len, ctx)?;
-
-    let values = match (&lhs, &rhs) {
-        (
-            PrimitiveOperand::Array { values: lhs, .. },
-            PrimitiveOperand::Array { values: rhs, .. },
-        ) => checked_op_lanes::<_, T, Op>(
-            LaneZip::new(lhs.as_slice(), rhs.as_slice()),
-            &valid_rows,
-            |(lhs, rhs)| (lhs, rhs),
-        ),
-        (
-            PrimitiveOperand::Array { values: lhs, .. },
-            PrimitiveOperand::Constant { value: rhs, .. },
-        ) => {
-            // Capture the constant by value so it stays hoisted out of the lane loop.
-            let rhs = *rhs;
-            checked_op_lanes::<_, T, Op>(lhs.as_slice(), &valid_rows, move |lhs| (lhs, rhs))
-        }
-        (
-            PrimitiveOperand::Constant { value: lhs, .. },
-            PrimitiveOperand::Array { values: rhs, .. },
-        ) => {
-            let lhs = *lhs;
-            checked_op_lanes::<_, T, Op>(rhs.as_slice(), &valid_rows, move |rhs| (lhs, rhs))
-        }
-        (
-            PrimitiveOperand::Constant { value: lhs, .. },
-            PrimitiveOperand::Constant { value: rhs, .. },
-        ) => {
-            let value = Op::checked(*lhs, *rhs)
-                .ok_or_else(|| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
-            return Ok(constant_result_array(value, len, &result_dtype));
-        }
-        (PrimitiveOperand::Null(_), _) | (_, PrimitiveOperand::Null(_)) => Ok(Buffer::zeroed(len)),
-    }
-    .map_err(|_lane| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
-
-    primitive_result_array::<T>(values, validity, &result_dtype)
-}
-
-/// Run `Op` over the lanes of `source` in the loop shape it declares: the one-pass early-exit
-/// kernel when `Op::CHECKED_VALUE_LOOP` is set, and the split value/failure kernel otherwise.
+/// The per-width arithmetic behind [`CheckedPrimitiveOp`], with each operation split into the value
+/// it produces and whether producing it failed.
 ///
-/// `#[inline]`: see [`checked_lanes`].
-#[inline]
-fn checked_op_lanes<S, T, Op>(
-    source: S,
-    valid_rows: &Mask,
-    mut to_operands: impl FnMut(S::Item) -> (T, T),
-) -> Result<Buffer<T>, usize>
-where
-    S: IndexedSource + Copy,
-    T: NativePType,
-    Op: CheckedPrimitiveOp<T>,
-{
-    if Op::CHECKED_VALUE_LOOP {
-        checked_lanes(source, valid_rows, |item| {
-            let (lhs, rhs) = to_operands(item);
-            Op::checked(lhs, rhs)
-        })
-    } else {
-        checked_apply_lanes(source, valid_rows, |item| {
-            let (lhs, rhs) = to_operands(item);
-            Op::apply(lhs, rhs)
-        })
-    }
-}
-
-fn primitive_result_array<T: NativePType>(
-    values: Buffer<T>,
-    validity: Validity,
-    dtype: &DType,
-) -> VortexResult<ArrayRef> {
-    let array = PrimitiveArray::new(values, validity).into_array();
-    if array.dtype() == dtype {
-        return Ok(array);
-    }
-    array.cast(dtype.clone())
-}
-
-fn constant_result_array<T>(value: T, len: usize, dtype: &DType) -> ArrayRef
-where
-    T: NativePType,
-    Scalar: From<T> + From<Option<T>>,
-{
-    if dtype.is_nullable() {
-        ConstantArray::new(Some(value), len).into_array()
-    } else {
-        ConstantArray::new(value, len).into_array()
-    }
-}
-
-/// A primitive binary-operator operand: a materialized buffer, a non-null constant, or an
-/// all-null constant.
-pub(crate) enum PrimitiveOperand<T: NativePType> {
-    Array {
-        values: Buffer<T>,
-        validity: Validity,
-    },
-    Constant {
-        value: T,
-        len: usize,
-        validity: Validity,
-    },
-    Null(usize),
-}
-
-impl<T: NativePType> PrimitiveOperand<T> {
-    pub(crate) fn try_new(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
-        if let Some(constant) = array.as_opt::<Constant>() {
-            return Ok(
-                match constant.scalar().as_primitive().try_typed_value::<T>()? {
-                    Some(value) => Self::Constant {
-                        value,
-                        len: array.len(),
-                        validity: if constant.scalar().dtype().is_nullable() {
-                            Validity::AllValid
-                        } else {
-                            Validity::NonNullable
-                        },
-                    },
-                    None => Self::Null(array.len()),
-                },
-            );
-        }
-
-        let array = array.clone().execute::<PrimitiveArray>(ctx)?;
-        let validity = array.validity()?;
-        let values = array.into_buffer::<T>();
-        Ok(Self::Array { values, validity })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Array { values, .. } => values.len(),
-            Self::Constant { len, .. } | Self::Null(len) => *len,
-        }
-    }
-
-    pub(crate) fn validity(&self) -> Validity {
-        match self {
-            Self::Array { validity, .. } => validity.clone(),
-            Self::Constant { validity, .. } => validity.clone(),
-            Self::Null(_) => Validity::AllInvalid,
-        }
-    }
-}
-
-trait CheckedArithmetic: NativePType {
-    const DIV_CHECKS_IN_VALUE_LOOP: bool;
-
-    /// How multiplication reports a failing lane, which is width-dependent in a way the other
-    /// operations are not. Each impl's `mul_failure` says why it chose what it chose.
+/// Every `_value` method **must** be total: it is called for rows behind nulls, whose operands are
+/// arbitrary, so it may not panic or trap. Integer division is the one that needs care, and
+/// [`CheckedDiv`] supplies the default instead of dividing when the divisor is rejected.
+pub(super) trait CheckedArithmetic: NativePType {
+    /// How multiplication reports a failing row.
+    ///
+    /// `Self` for the unsigned widths that have a widening multiply, so the row can hand back the
+    /// discarded high half rather than comparing. `bool` everywhere else: the narrow signed widths
+    /// already vectorize through a two-sided range check, floats never overflow, and the 64-bit
+    /// widths use a full-width evidence word.
     type MulFailure: Failure;
 
     fn add_value(self, rhs: Self) -> Self;
@@ -326,14 +126,11 @@ trait CheckedArithmetic: NativePType {
     fn mul_failure(self, rhs: Self) -> Self::MulFailure;
     fn div_value(self, rhs: Self) -> Self;
     fn div_error(self, rhs: Self) -> bool;
-    fn div_checked(self, rhs: Self) -> Option<Self>;
 }
 
 macro_rules! impl_checked_unsigned {
     ($ty:ty,widening_mul: $wide:ty) => {
         impl CheckedArithmetic for $ty {
-            const DIV_CHECKS_IN_VALUE_LOOP: bool = true;
-
             type MulFailure = $ty;
 
             #[inline(always)]
@@ -377,17 +174,10 @@ macro_rules! impl_checked_unsigned {
             fn div_error(self, rhs: Self) -> bool {
                 rhs == 0
             }
-
-            #[inline(always)]
-            fn div_checked(self, rhs: Self) -> Option<Self> {
-                self.checked_div(rhs)
-            }
         }
     };
     ($ty:ty,overflowing_mul) => {
         impl CheckedArithmetic for $ty {
-            const DIV_CHECKS_IN_VALUE_LOOP: bool = true;
-
             type MulFailure = u64;
 
             #[inline(always)]
@@ -433,11 +223,6 @@ macro_rules! impl_checked_unsigned {
             fn div_error(self, rhs: Self) -> bool {
                 rhs == 0
             }
-
-            #[inline(always)]
-            fn div_checked(self, rhs: Self) -> Option<Self> {
-                self.checked_div(rhs)
-            }
         }
     };
 }
@@ -445,8 +230,6 @@ macro_rules! impl_checked_unsigned {
 macro_rules! impl_checked_signed {
     ($ty:ty,widening_mul: $wide:ty) => {
         impl CheckedArithmetic for $ty {
-            const DIV_CHECKS_IN_VALUE_LOOP: bool = true;
-
             type MulFailure = bool;
 
             #[inline(always)]
@@ -477,7 +260,7 @@ macro_rules! impl_checked_signed {
             }
 
             /// A plain `bool`, because the two-sided range check is not the shape LLVM folds
-            /// into an overflow intrinsic, so these widths vectorize without reporting evidence.
+            /// into an overflow intrinsic, so these widths vectorize without wider evidence.
             #[inline(always)]
             fn mul_failure(self, rhs: Self) -> bool {
                 let product = (self as $wide) * (rhs as $wide);
@@ -494,17 +277,10 @@ macro_rules! impl_checked_signed {
             fn div_error(self, rhs: Self) -> bool {
                 rhs == 0 || (self == <$ty>::MIN && rhs == -1)
             }
-
-            #[inline(always)]
-            fn div_checked(self, rhs: Self) -> Option<Self> {
-                self.checked_div(rhs)
-            }
         }
     };
     ($ty:ty,overflowing_mul) => {
         impl CheckedArithmetic for $ty {
-            const DIV_CHECKS_IN_VALUE_LOOP: bool = true;
-
             type MulFailure = u64;
 
             #[inline(always)]
@@ -536,8 +312,7 @@ macro_rules! impl_checked_signed {
 
             /// A signed multiply overflows exactly when the discarded half of the true product
             /// differs from the sign extension of the half that was kept, so the two XOR to zero
-            /// on the lanes that fit. `tests::test_i64_multiply_overflow_boundaries` pins the
-            /// boundaries this replaces `overflowing_mul` at.
+            /// on the products that fit.
             #[inline(always)]
             #[expect(
                 clippy::cast_possible_truncation,
@@ -562,11 +337,6 @@ macro_rules! impl_checked_signed {
             fn div_error(self, rhs: Self) -> bool {
                 rhs == 0 || (self == <$ty>::MIN && rhs == -1)
             }
-
-            #[inline(always)]
-            fn div_checked(self, rhs: Self) -> Option<Self> {
-                self.checked_div(rhs)
-            }
         }
     };
 }
@@ -575,8 +345,6 @@ macro_rules! impl_checked_float {
     ($($ty:ty),+ $(,)?) => {
         $(
             impl CheckedArithmetic for $ty {
-                const DIV_CHECKS_IN_VALUE_LOOP: bool = false;
-
                 type MulFailure = bool;
 
                 #[inline(always)]
@@ -618,11 +386,6 @@ macro_rules! impl_checked_float {
                 fn div_error(self, _rhs: Self) -> bool {
                     false
                 }
-
-                #[inline(always)]
-                fn div_checked(self, rhs: Self) -> Option<Self> {
-                    Some(self / rhs)
-                }
             }
         )+
     };
@@ -641,34 +404,34 @@ impl_checked_float!(f16, f32, f64);
 #[cfg(test)]
 mod tests {
     use super::CheckedArithmetic;
+    use crate::scalar_fn::SinkResult;
 
     /// Values whose pairwise products are worth probing: the saturating boundaries, the sign-change
     /// pivots, and a spread of magnitudes that straddles the 64-bit split.
     const PROBES: &[i64] = &[
-        0,            //
-        1,            //
-        -1,           //
-        2,            //
-        -2,           //
-        3,            //
-        i64::MIN,     //
-        i64::MIN + 1, //
-        i64::MAX,     //
-        i64::MAX - 1, //
-        1 << 31,      //
-        1 << 32,      //
-        1 << 62,      //
-        -(1 << 62),   //
-        0x7FFF_FFFF,  //
-        -0x8000_0000, //
+        0,
+        1,
+        -1,
+        2,
+        -2,
+        3,
+        i64::MIN,
+        i64::MIN + 1,
+        i64::MAX,
+        i64::MAX - 1,
+        1 << 31,
+        1 << 32,
+        1 << 62,
+        -(1 << 62),
+        0x7FFF_FFFF,
+        -0x8000_0000,
     ];
 
-    /// Every `mul_failure` impl is either a bit trick or a two-sided range check, so hold each
-    /// against the obvious reference: `reference` is the width's own `checked_mul`, whose `None`
-    /// _is_ the definition of overflow.
+    /// Every `mul_failure` implementation is either a bit trick or a two-sided range check, so
+    /// hold each against `checked_mul`, whose `None` is the definition of overflow.
     #[track_caller]
     fn assert_agrees_with_checked_mul<T: CheckedArithmetic>(lhs: T, rhs: T, reference: Option<T>) {
-        let failed = lhs.mul_failure(rhs) != <T::MulFailure as Default>::default();
+        let failed = <T::MulFailure as SinkResult>::occurred(lhs.mul_failure(rhs));
 
         assert_eq!(failed, reference.is_none(), "{lhs:?} * {rhs:?}");
     }
@@ -680,14 +443,13 @@ mod tests {
                 assert_agrees_with_checked_mul(lhs, rhs, lhs.checked_mul(rhs));
 
                 let (lhs, rhs) = (lhs as u64, rhs as u64);
-
                 assert_agrees_with_checked_mul(lhs, rhs, lhs.checked_mul(rhs));
             }
         }
     }
 
-    /// The 8-bit widths are cheap enough to check exhaustively, which pins the shift of the
-    /// unsigned formula and the range check of the signed one against every product that exists.
+    /// The 8-bit widths are cheap enough to check exhaustively, pinning the unsigned shift and the
+    /// signed range check against every product that exists.
     #[test]
     fn mul_failure_agrees_with_checked_mul_exhaustively_at_8_bits() {
         for lhs in u8::MIN..=u8::MAX {

@@ -4,6 +4,7 @@
 //! Native comparison of primitive arrays via bit-packing lane kernels.
 
 use vortex_buffer::BitBuffer;
+use vortex_buffer::Buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 
@@ -11,18 +12,20 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
+use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
+use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
 use crate::scalar::Scalar;
-use crate::scalar_fn::fns::binary::PrimitiveOperand;
 use crate::scalar_fn::fns::binary::compare::collect_bits;
 use crate::scalar_fn::fns::binary::compare::collect_zip_bits;
 use crate::scalar_fn::fns::binary::compare::compare_validity;
 use crate::scalar_fn::fns::operators::CompareOperator;
+use crate::validity::Validity;
 
 /// Compare two primitive arrays of the same [`PType`].
 ///
@@ -126,5 +129,69 @@ fn compare_slice_constant<T: NativePType>(lhs: &[T], rhs: T, op: CompareOperator
         CompareOperator::Gte => collect_bits(lhs, |a: T| a.is_ge(rhs)),
         CompareOperator::Lt => collect_bits(lhs, |a: T| a.is_lt(rhs)),
         CompareOperator::Lte => collect_bits(lhs, |a: T| a.is_le(rhs)),
+    }
+}
+
+/// A primitive binary-operator operand: a materialized buffer, a non-null constant, or an
+/// all-null constant.
+///
+/// Splitting the constant out of the buffer is what lets the lane kernels above hoist it into a
+/// register instead of reading it back per lane.
+enum PrimitiveOperand<T: NativePType> {
+    /// A decoded column, one value per row.
+    Array {
+        values: Buffer<T>,
+        validity: Validity,
+    },
+
+    /// The same non-null value in every row.
+    Constant {
+        value: T,
+        len: usize,
+        validity: Validity,
+    },
+
+    /// A null in every row, carrying only the row count.
+    Null(usize),
+}
+
+impl<T: NativePType> PrimitiveOperand<T> {
+    fn try_new(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
+        if let Some(constant) = array.as_opt::<Constant>() {
+            return Ok(
+                match constant.scalar().as_primitive().try_typed_value::<T>()? {
+                    Some(value) => Self::Constant {
+                        value,
+                        len: array.len(),
+                        validity: if constant.scalar().dtype().is_nullable() {
+                            Validity::AllValid
+                        } else {
+                            Validity::NonNullable
+                        },
+                    },
+                    None => Self::Null(array.len()),
+                },
+            );
+        }
+
+        let array = array.clone().execute::<PrimitiveArray>(ctx)?;
+        let validity = array.validity()?;
+        let values = array.into_buffer::<T>();
+        Ok(Self::Array { values, validity })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Array { values, .. } => values.len(),
+            Self::Constant { len, .. } | Self::Null(len) => *len,
+        }
+    }
+
+    fn validity(&self) -> Validity {
+        match self {
+            Self::Array { validity, .. } => validity.clone(),
+            Self::Constant { validity, .. } => validity.clone(),
+            Self::Null(_) => Validity::AllInvalid,
+        }
     }
 }

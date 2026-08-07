@@ -297,13 +297,13 @@ fn test_multiply_overflow_on_null_lane_ignored<T: NativePType>(
     Ok(())
 }
 
-/// The hot pass OR-reduces evidence across whole 64-lane chunks before anything looks at it, so an
-/// overflow in a late chunk must still be caught, and must still be suppressed when its lane is
-/// null. Every other test here fits in a single chunk and cannot show either.
+/// The hot pass OR-reduces evidence across the whole row loop before anything looks at it, so an
+/// overflow late in the batch must still be caught, and must still be suppressed when its lane is
+/// null.
 #[rstest]
 #[case::reported(true)]
 #[case::suppressed_by_null(false)]
-fn test_multiply_overflow_survives_chunk_reduction(
+fn test_multiply_overflow_survives_batch_reduction(
     #[case] lane_is_valid: bool,
 ) -> VortexResult<()> {
     const LEN: u32 = 1000;
