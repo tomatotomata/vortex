@@ -20,6 +20,8 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::MaskedArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
+use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_tensor::scalar_fns::l2_norm::L2Norm;
@@ -60,7 +62,9 @@ fn bench_l2_norm(bencher: Bencher, input: ArrayRef) {
         .counter(ItemsCount::new(input.len()))
         .with_inputs(|| {
             (
-                L2Norm::try_new_array(input.clone()).unwrap().into_array(),
+                L2Norm
+                    .try_new_array(input.len(), EmptyOptions, [input.clone()])
+                    .unwrap(),
                 session.create_execution_ctx(),
             )
         })

@@ -22,10 +22,12 @@ use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::scalar::Scalar;
+use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_tensor::scalar_fns::cosine_similarity::CosineSimilarity;
@@ -85,9 +87,9 @@ fn bench_cosine(bencher: Bencher, lhs: ArrayRef, rhs: ArrayRef) {
     bencher
         .with_inputs(|| {
             (
-                CosineSimilarity::try_new_array(lhs.clone(), rhs.clone())
-                    .unwrap()
-                    .into_array(),
+                CosineSimilarity
+                    .try_new_array(lhs.len(), EmptyOptions, [lhs.clone(), rhs.clone()])
+                    .unwrap(),
                 session.create_execution_ctx(),
             )
         })

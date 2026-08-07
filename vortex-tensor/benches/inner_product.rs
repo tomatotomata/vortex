@@ -20,6 +20,8 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::FixedSizeListArray;
 use vortex_array::arrays::MaskedArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
+use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
 use vortex_tensor::scalar_fns::inner_product::InnerProduct;
@@ -62,9 +64,9 @@ fn bench_inner_product(bencher: Bencher, lhs: ArrayRef, rhs: ArrayRef) {
         .counter(ItemsCount::new(lhs.len()))
         .with_inputs(|| {
             (
-                InnerProduct::try_new_array(lhs.clone(), rhs.clone())
-                    .unwrap()
-                    .into_array(),
+                InnerProduct
+                    .try_new_array(lhs.len(), EmptyOptions, [lhs.clone(), rhs.clone()])
+                    .unwrap(),
                 session.create_execution_ctx(),
             )
         })
