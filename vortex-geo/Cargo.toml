@@ -47,11 +47,15 @@ name = "envelope"
 harness = false
 
 [[bench]]
-name = "predicate_bbox"
+name = "binary_predicates"
 harness = false
 
 [[bench]]
-name = "binary_predicates"
+name = "null_strategies"
+harness = false
+
+[[bench]]
+name = "predicate_bbox"
 harness = false
 
 [[bench]]

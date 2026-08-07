@@ -6,26 +6,19 @@
 use geo::Distance;
 use geo::Euclidean;
 use vortex_array::ArrayRef;
-use vortex_array::ExecutionCtx;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::Nullability;
-use vortex_array::dtype::PType;
-use vortex_array::expr::Expression;
-use vortex_array::expr::union_child_validities;
-use vortex_array::scalar_fn::Arity;
-use vortex_array::scalar_fn::ChildName;
+use vortex_array::scalar_fn::ElementSink;
 use vortex_array::scalar_fn::EmptyOptions;
-use vortex_array::scalar_fn::ExecutionArgs;
+use vortex_array::scalar_fn::RowFn;
+use vortex_array::scalar_fn::RowVisitor;
 use vortex_array::scalar_fn::ScalarFnId;
-use vortex_array::scalar_fn::ScalarFnVTable;
 use vortex_array::scalar_fn::TypedScalarFnInstance;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
-use crate::extension::validate_geometry_operands;
-use crate::scalar_fn::execute::execute_null_propagating;
+use crate::scalar_fn::row::GeometryRow;
 
 /// Planar (Euclidean) `ST_Distance` (no geodesic correction) between two native geometry
 /// operands, each a column or a constant literal.
@@ -43,66 +36,45 @@ impl GeoDistance {
     }
 }
 
-impl ScalarFnVTable for GeoDistance {
+impl RowFn for GeoDistance {
     type Options = EmptyOptions;
+
+    const ARG_NAMES: &'static [&'static str] = &["a", "b"];
+    const FALLIBLE: bool = true;
 
     fn id(&self) -> ScalarFnId {
         static ID: CachedId = CachedId::new("vortex.geo.distance");
         *ID
     }
 
-    fn serialize(&self, _: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
         Ok(Some(vec![]))
     }
 
-    fn deserialize(&self, _: &[u8], _: &VortexSession) -> VortexResult<Self::Options> {
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
         Ok(EmptyOptions)
     }
 
-    fn arity(&self, _: &Self::Options) -> Arity {
-        Arity::Exact(2)
-    }
-
-    fn child_name(&self, _: &Self::Options, child_idx: usize) -> ChildName {
-        match child_idx {
-            0 => ChildName::from("a"),
-            1 => ChildName::from("b"),
-            _ => unreachable!("distance has exactly two children"),
-        }
-    }
-
-    fn return_dtype(&self, _: &Self::Options, dtypes: &[DType]) -> VortexResult<DType> {
-        validate_geometry_operands(dtypes)?;
-        let nullability = Nullability::from(dtypes.iter().any(DType::is_nullable));
-        Ok(DType::Primitive(PType::F64, nullability))
-    }
-
-    fn execute(
+    /// Deliberately uses unit preparation: a batch-constant operand offers nothing
+    /// sound to hoist. geo computes linestring and polygon distances through its private
+    /// `nearest_neighbour_distance`, which builds the R*-trees for *both* sides inside each call,
+    /// and the point pairings are single expressions; reusing a tree across rows would mean
+    /// reimplementing geo's internals. A batch where both operands are constant already folds to
+    /// a single-row execution before the row loop.
+    fn dispatch<V: RowVisitor>(
         &self,
-        _: &Self::Options,
-        args: &dyn ExecutionArgs,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<ArrayRef> {
-        let a = args.get(0)?;
-        let b = args.get(1)?;
-        // Distance is a value, not a verdict: no bounding-rect test can decide it.
-        execute_null_propagating(&a, &b, |x, y| Euclidean.distance(x, y), None, ctx)
-    }
-
-    fn validity(
-        &self,
-        _: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        union_child_validities(expression)
-    }
-
-    fn is_strict(&self, _: &Self::Options) -> bool {
-        true
-    }
-
-    fn is_fallible(&self, _: &Self::Options) -> bool {
-        false
+        _options: &Self::Options,
+        _args: &[DType],
+        visitor: V,
+    ) -> VortexResult<V::Out> {
+        visitor.visit_prepared_into::<(GeometryRow, GeometryRow), ElementSink<f64>, _, _>(
+            |_| (),
+            |&(), (a, b), output| *output = Euclidean.distance(a, b),
+        )
     }
 }
 
@@ -179,8 +151,9 @@ mod tests {
         Ok(())
     }
 
-    /// Distance passes no bounding-rect rejection: a point far outside a constant polygon's
-    /// bounding rect still gets its true distance, alongside an inside point at distance zero.
+    /// Distance is a value rather than a verdict, so no bounding-rect rejection may fire for it: a
+    /// point far outside a constant polygon's rect still gets its true distance. Carried over from
+    /// #9076, which added the rejection to the predicates but deliberately not to this function.
     #[test]
     fn distance_to_constant_polygon_is_exact() -> VortexResult<()> {
         let session = vortex_array::array_session();
