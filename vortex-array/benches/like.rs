@@ -109,6 +109,15 @@ fn bench_per_row_patterns(bencher: Bencher, patterns: ArrayRef) {
 fn like_per_row_patterns(bencher: Bencher) {
     // A non-constant pattern child takes the per-row path; repeated patterns hit the
     // compile cache.
+    let patterns = VarBinViewArray::from_iter_str((0..ARRAY_SIZE).map(|_| "hello%")).into_array();
+    bench_per_row_patterns(bencher, patterns);
+}
+
+/// The per-row path with the compile cache hit on every row, carrying the infix pattern that
+/// [`like_per_row_distinct_patterns`] varies. Both compile the same shape and match the same way,
+/// so the only difference between them is how often a pattern is compiled.
+#[divan::bench]
+fn like_per_row_repeated_patterns(bencher: Bencher) {
     let patterns = VarBinViewArray::from_iter_str((0..ARRAY_SIZE).map(|_| "%aaa%")).into_array();
     bench_per_row_patterns(bencher, patterns);
 }
@@ -116,8 +125,8 @@ fn like_per_row_patterns(bencher: Bencher) {
 /// The per-row path with the compile cache defeated: every row carries a distinct pattern of the
 /// same shape, so each row pays one [`LikePattern`] compilation.
 ///
-/// Paired with [`like_per_row_patterns`] this isolates the cost of compiling a pattern from the cost
-/// of matching against it, which is what any kernel that cannot cache across rows would pay.
+/// Paired with [`like_per_row_repeated_patterns`] this isolates the cost of compiling a pattern from
+/// the cost of matching against it, which is what any kernel that cannot cache across rows pays.
 #[divan::bench]
 fn like_per_row_distinct_patterns(bencher: Bencher) {
     let patterns = VarBinViewArray::from_iter_str(
